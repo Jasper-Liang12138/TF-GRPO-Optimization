@@ -1,0 +1,31 @@
+# 构建经验库 (单卡)
+python RLHF/build_experience_gptoss120b.py \
+    --model /root/autodl-tmp/hf_cache/models--openai--gpt-oss-120b \
+    --quantization awq \
+    --dapo_parquet dataset/dapo-math-17k.parquet \
+    --exp_size 100 \
+    --max_model_len 4096 \
+    --gpu_memory_utilization 0.95
+
+# 推理 (单卡)
+python RLHF/inference_math_vllm.py \
+    --model /root/autodl-tmp/hf_cache/models--openai--gpt-oss-120b \
+    --quantization awq \
+    --dataset AQuA \
+    --max_model_len 4096 \
+    --gpu_memory_utilization 0.95
+
+# 1. 强制关闭加速器 (关键！)
+export HF_HUB_ENABLE_HF_TRANSFER=0
+
+# 2. 设置国内镜像
+export HF_ENDPOINT=https://hf-mirror.com
+
+# 3. 增加超时宽容度 (防止大文件断连)
+export HF_HUB_DOWNLOAD_TIMEOUT=600
+
+# 4. 开始下载 (标准模式，会自动处理分片)
+huggingface-cli download openai/gpt-oss-120b \
+    --local-dir /root/autodl-tmp/hf_cache/models--openai--gpt-oss-120b \
+    --resume-download
+
