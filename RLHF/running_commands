@@ -1,11 +1,11 @@
 # 构建经验库 (单卡)
 python RLHF/build_experience_deepseek.py \
-    --model_name deepseek-chat \
-    --dapo_parquet dataset/dapo-math-17k.parquet \
-    --exp_size 100 \
+    --model deepseek-chat \
+    --data_path /root/autodl-tmp/LLM_Adapters/LLM_Adapters/TF-GRPO-EXP/dataset/dapo-math-17k.parquet \
+    --sample_size 100 \
     --group_size 4 \
     --epochs 3 \
-    --max_new_tokens 2000 
+    --max_new_tokens 4096 
 
 # 推理 (单卡)
 python RLHF/math_inference.py \

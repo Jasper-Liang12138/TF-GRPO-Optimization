@@ -1,14 +1,12 @@
 import re
 import os
-import torch
-import numpy as np
 import random
 import json
-from typing import List
+import statistics
+from typing import List, Dict, Any
 from tqdm import tqdm
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
+from fractions import Fraction
 
 class TF_GRPO:
     def __init__(
@@ -16,298 +14,266 @@ class TF_GRPO:
         api_key: str,
         model_name: str = "deepseek-chat",
         group_size=5,
-        max_experiences=100,
         max_new_tokens=4096,
-        # Embedding 模型改为本地轻量级模型，用于计算相似度
-        embedding_model_name: str = "all-MiniLM-L6-v2", 
     ):
-        # 初始化 OpenAI 客户端
-        self.client = OpenAI(api_key=api_key,
-                             base_url="https://api.deepseek.com")
+        self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
         self.model_name = model_name
-        
         self.group_size = group_size
-        self.max_experiences = max_experiences
         self.max_new_tokens = max_new_tokens
         
-        self.experience_bank = []
-        self.exp_embeddings = []
-        self.exp_embeddings_matrix = None
-
-        # 初始化 Embedding 模型 (运行在 CPU 或 GPU 均可，显存占用极小)
-        print(f"[TF-GRPO] Loading Embedding Model: {embedding_model_name}...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.embed_model = SentenceTransformer(embedding_model_name, device=device)
-
-    # ===================== 摘要推理 =====================
-    def summarize_reasoning(self, reasoning: str) -> str:
-        """
-        使用 DeepSeek-V3.2 对推理过程进行摘要
-        """
-        reasoning = reasoning.strip()
-        if not reasoning:
-            return reasoning
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant. Summarize the following reasoning process concisely."},
-                    {"role": "user", "content": reasoning}
-                ],
-                max_tokens=512,
-                temperature=0.5   
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"[Warning] Summarize failed: {e}")
-            return reasoning
-
-    # ===================== 计算文本 embedding (使用 SentenceTransformer) =====================
-    def embed_func(self, text: str):
-        # SentenceTransformer 直接返回 numpy array
-        return self.embed_model.encode(text)
-
-    # ===================== Prompt 构建 =====================
-    def build_prompt(self, question: str) -> List[dict[str, str]]:
-        messages = [
-            {
-                "role": "system",
-                "content": f"You are a math problem solver. Solve the problem step by step and give the final answer within {self.max_new_tokens} tokens."
-            },
-            {
-                "role": "user",
-                "content": f"Problem: {question}\n"
-            }
-        ]
-        return messages
-
-    def build_prompt_inference(self, question: str) -> List[dict[str, str]]:
-        # 修改为 Chat 格式
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a math problem solver. Please refer to experience to solve the problems."
-            },
-            {
-                "role": "user",
-                "content": f"Problem: {question}\n"
-            }
-        ]
-        return messages
-
-    def build_aqua_prompt(self, question_with_choices: str) -> List[dict[str, str]]:
-        # 修改为 Chat 格式
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a math problem solver. Please Solve the following multiple-choice math problem referring to experience.Pick exactly one option from {A, B, C, D, E}.Answer: <A/B/C/D/E>"
-            },
-            {
-                "role": "user",
-                "content": f"Problem: {question_with_choices}\n"
-            }
-        ]
-        return messages
-
-    # ===================== 相似度检索 (保持逻辑不变) =====================
-    def extract_similar_experiences(self, question: str, top_k) -> List[str]:
-        if not self.experience_bank or self.exp_embeddings_matrix is None:
-            return self.experience_bank[-top_k:]
-
-        q_emb = self.embed_func(question).reshape(1, -1)
-        sims = cosine_similarity(q_emb, self.exp_embeddings_matrix)[0]
-
-        top_k = min(top_k, len(self.experience_bank))
-        if top_k <= 0:
-            return []
-
-        top_indices = sims.argsort()[-top_k:][::-1]
-        similarity_threshold = 0.1
-        top_experiences = [
-            self.experience_bank[i]
-            for i in top_indices
-            if sims[i] >= similarity_threshold
-        ]
-        return top_experiences
-
-    # ===================== 生成 (调用 deepseek-chat API) =====================
-    def batch_group_generate(self, prompts: List[dict[str, str]]) -> List[str]:
-        """
-        API 不支持像本地模型那样的 batch tensor 输入，
-        这里输入如果是 List[List[Dict]] (多条不同的prompt)，需要循环调用。
-        如果输入是 List[Dict] (单条 prompt)，直接调用。
-        """
-        # 兼容性处理：如果输入是单个 prompt (List[Dict])
-        if isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], dict):
-            single_prompt = prompts
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=single_prompt,
-                    temperature=0, #数学推理任务建议0
-                    max_tokens=self.max_new_tokens,
-                    n=1 # 每次生成一条
-                )
-                return [response.choices[0].message.content]
-            except Exception as e:
-                print(f"API Error: {e}")
-                return [""]
+        # 经验库：Key为题目在 dataset 中的索引，Value为经验列表
+        self.experience_bank: Dict[int, List[str]] = {}
         
-        # 暂时不支持一次传入多个不同的 prompt list，如果需要可在这里加循环
-        return ["Error: Invalid prompt format"]
+        # 新增：持久化的数据集，确保多轮 Epoch 使用同一批随机采样的数据
+        self.dataset: List[Dict] = []
 
-    # ===================== 辅助函数 (保持不变) =====================
+    # ===================== 1. 基础工具 & 优势计算 =====================
+    
     def extract_answer(self, text: str) -> str:
-        patterns = [r"Answer\s*[:\-]?\s*([^\n$]+)"]
+        patterns = [
+            r"\\boxed\{([^{}]+)\}",
+            r"Answer\s*[:\-]?\s*([^\n$]+)"
+        ]
         for p in patterns:
             m = re.search(p, text, re.IGNORECASE)
             if m:
-                ans = m.group(1).strip().replace("$", "").replace("\\", "").strip()
-                if re.match(r"^[\d\.\-/]+$", ans): return ans
+                return m.group(1).strip().replace("$", "").replace("\\", "").strip()
         for l in reversed(text.splitlines()):
             l_clean = l.replace("$","").replace("\\","").strip()
-            if re.match(r"^[\d\.\-/]+$", l_clean): return l_clean
+            if re.match(r"^-?[\d\.\-/]+$", l_clean): return l_clean
         return ""
 
-    def reasoning_quality(self, reasoning: str) -> float:
-        if not reasoning: return 0.0
-        text = reasoning.strip()
-        score = 0.0
-        math_ops = "+-*/=^"
-        n_math = sum(text.count(op) for op in math_ops)
-        score += min(n_math, 20) * 0.2
-        if "step" in text.lower(): score += 1.0
-        if len(text) > 50: score += 1.0
-        return score
-
-    def reward(self, output: str, gold: str) -> float:
-        answer = self.extract_answer(output)
-        answer_reward = float(answer == str(gold))
-        reasoning_reward = self.reasoning_quality(output)
-        alpha, beta = 0.7, 0.3
-        return alpha * answer_reward + beta * reasoning_reward
-
-    def select_best(self, outputs: List[str], gold: str) -> str:
-        if not outputs: return None
-        scores = [self.reward(o, gold) for o in outputs]
-        if max(scores) > 0:
-            return outputs[scores.index(max(scores))]
-        return max(outputs, key=self.reasoning_quality)
-
-    def extract_reasoning_from_output(self, prompt, output_text: str) -> str:
-        # API 返回的内容就是 Assistant 的回复，不需要像本地模型那样去除 prompt
-        reasoning = output_text
-        # 清洗逻辑
-        reasoning = re.sub(r"```.*?```", "", reasoning, flags=re.DOTALL)
-        reasoning = re.sub(r"\[experience\s*\d+\].*?(?=\n\n|answer|final answer|$)", "", reasoning, flags=re.DOTALL | re.IGNORECASE)
-        return reasoning.strip()
-
-    def update_experience(self, problem: str, reasoning: str, gold: str):
-        reasoning = reasoning.strip()
-        if not reasoning: return
+    def check_correctness(self, output: str, gold: str) -> float:
+        pred = self.extract_answer(output)
+        if not pred: return 0.0
         
-        # 使用 GPT-3.5 进行摘要
-        summarized_reasoning = self.summarize_reasoning(reasoning)
+        try:
+            # 尝试数值转换比较
+            # 处理分数、逗号等，例如 "1,000" -> 1000
+            def clean_num(s):
+                s = s.replace(",", "")
+                if "/" in s: return float(Fraction(s))
+                return float(s)
+                
+            return 1.0 if abs(clean_num(pred) - clean_num(str(gold))) < 1e-6 else 0.0
+        except:
+            # 如果无法转数字，回退到字符串比较
+            return 1.0 if pred.strip() == str(gold).strip() else 0.0
 
-        experience = (
-            f"Problem:\n{problem}\n\n"
-            f"Experience:\n{summarized_reasoning}\n\n"
-            f"Gold Answer:\n{gold}"
+    def compute_advantages(self, rewards: List[float]) -> List[float]:
+        if not rewards: return []
+        if len(rewards) == 1: return [0.0]
+        mean_r = statistics.mean(rewards)
+        std_r = statistics.stdev(rewards)
+        if std_r == 0:
+            return [0.0] * len(rewards)
+        return [(r - mean_r) / (std_r + 1e-8) for r in rewards]
+
+    # ===================== 2. LLM 调用封装 =====================
+
+    def call_llm(self, messages: List[Dict], temperature=0.7, json_mode=False) -> str:
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=self.max_new_tokens if not json_mode else 2048,
+                response_format={"type": "json_object"} if json_mode else None
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[API Error]: {e}")
+            return ""
+
+    # ===================== 3. 核心算子实现 =====================
+
+    def batch_summarize(self, question: str, outputs: List[str]) -> Dict[str, Any]:
+            """
+            一次性对 G 条轨迹进行分别总结 + 整体总结。
+            返回格式:
+            {
+                "individual_summaries": ["summary_for_trace_1", "summary_for_trace_2", ...],
+                "overall_summary": "summary_for_all"
+            }
+            """
+            # 构建输入文本，标记清楚每一条轨迹
+            traces_text = ""
+            for i, out in enumerate(outputs):
+                # 为了防止 prompt 过长，可以适当截断每条轨迹（例如前2000字符）
+                traces_text += f"--- [Attempt {i+1}] ---\n{out}\n\n"
+
+            prompt = (
+                f"Problem: {question}\n\n"
+                f"Here are {len(outputs)} different attempts to solve this problem:\n"
+                f"{traces_text}\n"
+                "--- TASK ---\n"
+                "1. Analyze each attempt INDIVIDUALLY: Summarize its method and identify key errors or success factors (2-3 sentences each).For example, 'In attempt 1, the agent...'.\n"
+                "2. Analyze ALL attempts COLLECTIVELY: Provide a brief overall summary and precautions for this problem type.\n\n"
+                "--- OUTPUT FORMAT ---\n"
+                "Return a strictly valid JSON object with exactly two keys:\n"
+                "{\n"
+                '  "individual_summaries": ["summary 1", "summary 2", ...],\n'
+                '  "overall_summary": "your overall insight string"\n'
+                "}"
+            )
+            
+            messages = [{"role": "user", "content": prompt}]
+            
+            # 强制 JSON 模式
+            res = self.call_llm(messages, temperature=0.7, json_mode=True)
+            
+            try:
+                data = json.loads(res)
+                # 简单的校验，确保返回列表长度对得上
+                if not isinstance(data.get("individual_summaries"), list):
+                    data["individual_summaries"] = ["Error parsing summary"] * len(outputs)
+                return data
+            except json.JSONDecodeError:
+                print("[Batch Summarize] JSON parsing failed.")
+                return {
+                    "individual_summaries": ["Summary failed"] * len(outputs),
+                    "overall_summary": "Summary failed"
+                }
+
+    def exp_controller(self, question: str, old_exps: List[str], observations: List[Dict]) -> List[str]:
+        e_text = json.dumps(old_exps, indent=1) if old_exps else "[] (No prior experience)"
+        obs_text = ""
+        for i, obs in enumerate(observations):
+            if i != len(observations) - 1:
+                obs_text += (
+                    f"[Attempt {i+1}]\n"
+                    f"Advantage Score: {obs['advantage']:.4f}\n"
+                    f"Summary: {obs['summary']}\n\n"
+                )
+            else:  # 最后一个是整体总结
+                obs_text += (
+                    f"[Overall Summary]\n"
+                    f"Advantage Score: {obs['advantage']:.4f}\n"
+                    f"Summary: {obs['summary']}\n\n"
+                )
+        system_prompt = "You are a meta-learning optimizer for math reasoning."
+        user_prompt = (
+            f"Current Problem: {question}\n\n"
+            f"=== OLD EXPERIENCE BANK (E) ===\n{e_text}\n\n"
+            f"=== NEW OBSERVATIONS (from current G={self.group_size} rollouts) ===\n{obs_text}\n\n"
+            "=== INSTRUCTIONS ===\n"
+            "Use the Advantage Scores (A_i) to refine the Experience Bank(Experience Bank's attempts'number should be equal to G):\n"
+            "1. **KEEP**: Retain old experiences that align with high-advantage attempts.\n"
+            "2. **MODIFY**: Correct an old experience if a high-advantage attempt shows a better way.\n"
+            "3. **DELETE**: Remove experiences that led to low-advantage outcomes.\n"
+            "4. **ADD**: Extract new insights from high-advantage attempts.\n\n"
+            "5. **IMPROVEMENT**: Revise the Overall Summary.\n\n" 
+            "Output the updated list of experiences as a JSON object: {\"experiences\": [\"exp1\", \"exp2\"]}"
         )
 
-        self.experience_bank.append(experience)
-        
-        # 更新 embedding
-        emb = self.embed_func(experience)
-        self.exp_embeddings.append(emb)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        res = self.call_llm(messages, temperature=0.2, json_mode=True)
+        try:
+            data = json.loads(res)
+            new_exps = data.get("experiences", [])
+            return [str(e) for e in new_exps if isinstance(e, str)]
+        except:
+            return old_exps
 
-        if len(self.experience_bank) > self.max_experiences:
-            self.experience_bank.pop(0)
-            self.exp_embeddings.pop(0)
+    # ===================== 4. 主训练循环 =====================
 
-        if self.exp_embeddings:
-            self.exp_embeddings_matrix = np.vstack(self.exp_embeddings)
-        else:
-            self.exp_embeddings_matrix = None
-
-    def load_experience_bank(self, experience_data: list):
-        if not isinstance(experience_data, list): raise ValueError("Must be list")
-        self.experience_bank = experience_data[-self.max_experiences:]
-        self.exp_embeddings = []
-        print(f"[TF-GRPO] Loading {len(self.experience_bank)} experiences...")
-        for exp in tqdm(self.experience_bank):
-            emb = self.embed_func(exp)
-            self.exp_embeddings.append(emb)
-        if self.exp_embeddings:
-            self.exp_embeddings_matrix = np.vstack(self.exp_embeddings)
-
-    def build_experience_from_dapo_epochs(self, parquet_path, sample_size=100, epochs=3):
+    def train_loop(self, parquet_path: str, epochs=3, sample_size=100):
         import pandas as pd
         
-        df = pd.read_parquet(parquet_path)
-        records = df.to_dict(orient="records")
+        # ====== 修改部分：随机采样与 Dataset 持久化逻辑 ======
+        if self.dataset:
+            print(f"[TF-GRPO] Using existing dataset with {len(self.dataset)} samples.")
+        else:
+            print(f"[TF-GRPO] Loading dataset from {parquet_path}...")
+            df = pd.read_parquet(parquet_path)
+            records = df.to_dict(orient="records")
+            
+            # 随机抽取 sample_size 道题
+            # 如果原始数据不够，则全量使用
+            actual_size = min(sample_size, len(records))
+            self.dataset = random.sample(records, actual_size)
+            print(f"[TF-GRPO] Randomly sampled {actual_size} problems. Dataset initialized.")
+        # =================================================
 
         for ep in range(epochs):
-            print(f"\n[TF-GRPO] Epoch {ep+1}/{epochs}")
-            samples = random.sample(records, min(sample_size, len(records)))
+            print(f"\n{'='*20} Epoch {ep+1}/{epochs} {'='*20}")
             
-            for sample_idx, item in enumerate(tqdm(samples)):
-                q = item["prompt"][0]["content"]
-                # 兼容 DAPO 数据集的 ground truth 路径
-                a = item["reward_model"]["ground_truth"]
+            # 遍历 dataset
+            for idx, item in enumerate(tqdm(self.dataset)):
+                
+                # 数据解析
+                q, gold = item["prompt"][0]["content"], item["reward_model"]["ground_truth"]
 
-                base_prompt = self.build_prompt(q)
-                top_experiences = self.extract_similar_experiences(q, self.group_size)
+                # 1. 提取经验 (按 idx 顺序提取)
+                current_experiences = self.experience_bank.get(idx, [])
+                
+                # 2. Rollout
+                if current_experiences:
+                    exp_str = "\n".join([f"{i+1}. {e}" for i, e in enumerate(current_experiences)])
+                    system_content = (
+                        "You are a math problem solver. "
+                        "Please refer to the following historical experiences to solve this problem:\n"
+                        f"{exp_str}\n\n"
+                        "Think step by step."
+                    )
+                else:
+                    system_content = "You are a math problem solver. Think step by step."
+
+                messages = [{"role": "system", 
+                             "content": system_content}, 
+                            {"role": "user", 
+                             "content": f"Problem: {q}\n"}]
                 
                 outputs = []
-                # 策略：如果无经验，直接跑一次；如果有经验，结合每一条经验分别跑一次
-                if not top_experiences:
-                    out = self.batch_group_generate(base_prompt)[0]
-                    outputs.append(out)
-                else:
-                    for exp_idx, exp in enumerate(top_experiences, 1):
-                        import copy
-                        p = copy.deepcopy(base_prompt)
-                        # 将经验插入到 User 消息中
-                        p[1]["content"] += (
-                            "\nUse the following reasoning experience internally:\n"
-                            f"[Experience {exp_idx}]\n{exp}\n"
-                        )
-                        out = self.batch_group_generate(p)[0]
-                        outputs.append(out)
+                for _ in range(self.group_size):
+                    outputs.append(self.call_llm(messages, temperature=0.7))
 
-                best = self.select_best(outputs, a)
-                if best:
-                    self.update_experience(q, best, a)
-                    print(f"[TF-GRPO] Problem: {q}\nGold Answer: {a}\nBest Answer: {best}\n")
+                # 3. Advantage
+                rewards = [self.check_correctness(o, gold) for o in outputs]
+                advantages = self.compute_advantages(rewards)
 
-            # 保存中间结果
-            with open(f"experience_bank_ep{ep}.json", "w") as f:
-                json.dump(self.experience_bank, f, indent=2)
-        with open(f"experience_bank_ep.json", "w") as f:
-            json.dump(self.experience_bank, f, indent=2)
+                # 4. Batch Summarization (1次 API 调用)
+                
+                # 只要有不一致的Reward，或者为了积累经验，就进行总结
+                # 这里建议始终进行，或者根据需求加 if 判断
+                summary_result = self.batch_summarize(q, outputs)
+                
+                individual_summaries = summary_result.get("individual_summaries", [])
+                overall_summary = summary_result.get("overall_summary", "")
 
+                # 补齐数据（防止模型返回的列表长度不够）
+                if len(individual_summaries) < self.group_size:
+                    individual_summaries.extend([""] * (self.group_size - len(individual_summaries)))
 
+                observations = []
+                
+                # A. 填入个体总结
+                for i in range(self.group_size):
+                    observations.append({
+                        "summary": individual_summaries[i], 
+                        "advantage": advantages[i]
+                    })
+                
+                # B. 填入整体总结
+                # 整体总结的 advantage 给平均分
+                avg_advantage = statistics.mean(advantages) if advantages else 0.0
+                observations.append({
+                    "summary": f"[Global Insight] {overall_summary}", 
+                    "advantage": avg_advantage
+                })
+                # 调用 Controller 更新
+                updated_experiences = self.exp_controller(q, current_experiences, observations)
+                self.experience_bank[idx] = updated_experiences
+                print(f" Problem {idx}: Updated Experience Bank: {updated_experiences}")
 
-    # ===================== 用于构建benchmark =========
-    def generate_without_grpo(self, prompts: List[dict[str, str]]) -> List[str]:
+                # Debug print
+                if (idx + 1) % 10 == 0:
+                    print(f" Problem {idx+1}: AvgReward={avg_advantage}")
 
-        # 兼容性处理：如果输入是单个 prompt (List[Dict])
-        if isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], dict):
-            single_prompt = prompts
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=single_prompt,
-                    temperature=0, #数学推理任务建议0
-                    max_tokens=self.max_new_tokens,
-                    n=1 # 每次生成一条
-                )
-                return [response.choices[0].message.content]
-            except Exception as e:
-                print(f"API Error: {e}")
-                return [""]
-            
-        # 暂时不支持一次传入多个不同的 prompt list，如果需要可在这里加循环
-        return ["Error: Invalid prompt format"]
+            # 保存 Epoch 结果
+            with open(f"experience_bank_epoch_{ep+1}.json", "w") as f:
+                dump_data = [{"index": k, "experiences": v} for k, v in self.experience_bank.items()]
+                json.dump(dump_data, f, indent=2)
