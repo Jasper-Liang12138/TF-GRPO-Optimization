@@ -2,6 +2,8 @@ import re
 import os
 import torch
 import numpy as np
+import random
+import json
 from typing import List
 from tqdm import tqdm
 from sklearn.metrics.pairwise import cosine_similarity
@@ -12,15 +14,16 @@ class TF_GRPO:
     def __init__(
         self,
         api_key: str,
-        model_name: str = "gpt-3.5-turbo",
+        model_name: str = "deepseek-chat",
         group_size=5,
         max_experiences=100,
-        max_new_tokens=512,
+        max_new_tokens=4096,
         # Embedding 模型改为本地轻量级模型，用于计算相似度
         embedding_model_name: str = "all-MiniLM-L6-v2", 
     ):
         # 初始化 OpenAI 客户端
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key,
+                             base_url="https://api.deepseek.com")
         self.model_name = model_name
         
         self.group_size = group_size
@@ -36,10 +39,10 @@ class TF_GRPO:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.embed_model = SentenceTransformer(embedding_model_name, device=device)
 
-    # ===================== 摘要推理 (改为调用 GPT-3.5) =====================
+    # ===================== 摘要推理 =====================
     def summarize_reasoning(self, reasoning: str) -> str:
         """
-        使用 GPT-3.5 对推理过程进行摘要
+        使用 DeepSeek-V3.2 对推理过程进行摘要
         """
         reasoning = reasoning.strip()
         if not reasoning:
@@ -52,8 +55,8 @@ class TF_GRPO:
                     {"role": "system", "content": "You are a helpful assistant. Summarize the following reasoning process concisely."},
                     {"role": "user", "content": reasoning}
                 ],
-                max_tokens=150,
-                temperature=0.5
+                max_tokens=512,
+                temperature=0.5   
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -70,7 +73,7 @@ class TF_GRPO:
         messages = [
             {
                 "role": "system",
-                "content": "You are a math problem solver. Solve the problem step by step and give the final answer."
+                "content": f"You are a math problem solver. Solve the problem step by step and give the final answer within {self.max_new_tokens} tokens."
             },
             {
                 "role": "user",
@@ -94,15 +97,18 @@ class TF_GRPO:
         return messages
 
     def build_aqua_prompt(self, question_with_choices: str) -> List[dict[str, str]]:
-        content = (
-            "Solve the following multiple-choice math problem referring to experience.\n"
-            "Pick exactly one option from {A, B, C, D, E}.\n"
-            "Do NOT output the option text.\n"
-            "Your output must end with exactly one line:\n"
-            "Answer: <A/B/C/D/E>\n\n"
-            f"Problem:\n{question_with_choices}\n"
-        )
-        return [{"role": "user", "content": content}]
+        # 修改为 Chat 格式
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a math problem solver. Please Solve the following multiple-choice math problem referring to experience.Pick exactly one option from {A, B, C, D, E}.Answer: <A/B/C/D/E>"
+            },
+            {
+                "role": "user",
+                "content": f"Problem: {question_with_choices}\n"
+            }
+        ]
+        return messages
 
     # ===================== 相似度检索 (保持逻辑不变) =====================
     def extract_similar_experiences(self, question: str, top_k) -> List[str]:
@@ -125,7 +131,7 @@ class TF_GRPO:
         ]
         return top_experiences
 
-    # ===================== 生成 (调用 OpenAI API) =====================
+    # ===================== 生成 (调用 deepseek-chat API) =====================
     def batch_group_generate(self, prompts: List[dict[str, str]]) -> List[str]:
         """
         API 不支持像本地模型那样的 batch tensor 输入，
@@ -139,7 +145,7 @@ class TF_GRPO:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=single_prompt,
-                    temperature=0.7,
+                    temperature=0, #数学推理任务建议0
                     max_tokens=self.max_new_tokens,
                     n=1 # 每次生成一条
                 )
@@ -274,7 +280,34 @@ class TF_GRPO:
                 best = self.select_best(outputs, a)
                 if best:
                     self.update_experience(q, best, a)
+                    print(f"[TF-GRPO] Problem: {q}\nGold Answer: {a}\nBest Answer: {best}\n")
 
             # 保存中间结果
             with open(f"experience_bank_ep{ep}.json", "w") as f:
                 json.dump(self.experience_bank, f, indent=2)
+        with open(f"experience_bank_ep.json", "w") as f:
+            json.dump(self.experience_bank, f, indent=2)
+
+
+
+    # ===================== 用于构建benchmark =========
+    def generate_without_grpo(self, prompts: List[dict[str, str]]) -> List[str]:
+
+        # 兼容性处理：如果输入是单个 prompt (List[Dict])
+        if isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], dict):
+            single_prompt = prompts
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=single_prompt,
+                    temperature=0, #数学推理任务建议0
+                    max_tokens=self.max_new_tokens,
+                    n=1 # 每次生成一条
+                )
+                return [response.choices[0].message.content]
+            except Exception as e:
+                print(f"API Error: {e}")
+                return [""]
+            
+        # 暂时不支持一次传入多个不同的 prompt list，如果需要可在这里加循环
+        return ["Error: Invalid prompt format"]

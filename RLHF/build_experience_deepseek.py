@@ -2,24 +2,24 @@ import sys
 import os
 import argparse
 import random
-from tf_grpo_gptoss120b import TF_GRPO
+from tf_grpo_deepseek import TF_GRPO
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 
 def parse_args():
-    parser = argparse.ArgumentParser("Build Experience Bank with GPT-3.5 API")
+    parser = argparse.ArgumentParser("Build Experience Bank with DEEPSEEK API")
 
     parser.add_argument(
         "--api_key",
         type=str,
-        default=os.getenv("OPENAI_API_KEY"),
-        help="OpenAI API Key (optional if env var set)",
+        default=os.getenv("DEEPSEEK_API_KEY"),
+        help="DEEPSEEK_API_KEY (optional if env var set)",
     )
     parser.add_argument(
         "--model_name",
         type=str,
-        default="gpt-3.5-turbo",
+        default="deepseek-chat",
         help="Model name to use",
     )
     parser.add_argument(
@@ -43,7 +43,12 @@ def parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=1,
+        default=3,
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=4096,
     )
 
     return parser.parse_args()
@@ -67,7 +72,7 @@ def main():
         model_name=args.model_name,
         group_size=args.group_size,
         max_experiences=args.exp_size,
-        max_new_tokens=512
+        max_new_tokens=args.max_new_tokens
     )
 
     # Build Experience Bank
