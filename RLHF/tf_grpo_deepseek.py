@@ -21,10 +21,9 @@ class TF_GRPO:
         self.group_size = group_size
         self.max_new_tokens = max_new_tokens
         
-        # 经验库：Key为题目在 dataset 中的索引，Value为经验列表
-        self.experience_bank: Dict[int, List[str]] = {}
+        # 经验库：Key为题目索引，Value为字典列表 [{"text":Str, "score":Float}, ...]
+        self.experience_bank: Dict[int, List[Dict[str, Any]]] = {}
         
-        # 新增：持久化的数据集，确保多轮 Epoch 使用同一批随机采样的数据
         self.dataset: List[Dict] = []
 
     # ===================== 1. 基础工具 & 优势计算 =====================
@@ -43,21 +42,47 @@ class TF_GRPO:
             if re.match(r"^-?[\d\.\-/]+$", l_clean): return l_clean
         return ""
 
+    # === 格式检查 ===
+    def check_format(self, text: str) -> float:
+        """检查是否使用了标准格式，例如 \boxed{}"""
+        # 给予微小奖励，鼓励模型遵守指令
+        if r"\boxed{" in text:
+            return 1.0
+        return 0.0
+
+    # === 过程质量检查（启发式） ===
+    def check_process_quality(self, text: str) -> float:
+        """
+        基于规则的简单质量检查：
+        1. 长度惩罚：太短可能是在瞎猜。
+        2. 结构奖励：包含换行符、步骤词、LaTeX公式符号。
+        """
+        # 1. 长度检查 (过短给0分)
+        if len(text) < 50:
+            return 0.0
+            
+        score = 0.0
+        # 2. LaTeX 密度 (粗略判断是否有数学推导)
+        if "$" in text or "\\" in text:
+            score += 0.5
+            
+        # 3. 步骤词 (简单的关键词匹配)
+        steps_keywords = ["step", "first", "therefore", "since", "because"]
+        if any(w in text.lower() for w in steps_keywords):
+            score += 0.5
+            
+        return min(1.0, score) # 上限 1.0
+
     def check_correctness(self, output: str, gold: str) -> float:
         pred = self.extract_answer(output)
         if not pred: return 0.0
-        
         try:
-            # 尝试数值转换比较
-            # 处理分数、逗号等，例如 "1,000" -> 1000
             def clean_num(s):
                 s = s.replace(",", "")
                 if "/" in s: return float(Fraction(s))
                 return float(s)
-                
             return 1.0 if abs(clean_num(pred) - clean_num(str(gold))) < 1e-6 else 0.0
         except:
-            # 如果无法转数字，回退到字符串比较
             return 1.0 if pred.strip() == str(gold).strip() else 0.0
 
     def compute_advantages(self, rewards: List[float]) -> List[float]:
@@ -68,6 +93,23 @@ class TF_GRPO:
         if std_r == 0:
             return [0.0] * len(rewards)
         return [(r - mean_r) / (std_r + 1e-8) for r in rewards]
+    
+    def compute_composite_reward(self, output: str, gold: str) -> float:
+        # 1. 计算各个维度的原始分 (0.0 ~ 1.0)
+        r_acc = self.check_correctness(output, gold)
+        r_fmt = self.check_format(output)
+        r_proc = self.check_process_quality(output)
+        
+        # 2. 设定权重 (Weights)
+        # 核心原则：正确性(Accuracy)必须占主导，格式和过程作为辅助(Shaping Rewards)
+        w_acc = 1.0   # 正确性权重
+        w_fmt = 0.1   # 格式奖励权重 (例如用了 \boxed{})
+        w_proc = 0.1  # 过程质量权重 (长度、LaTeX、关键词)
+        
+        # 3. 计算加权总分
+        total_reward = (r_acc * w_acc) + (r_fmt * w_fmt) + (r_proc * w_proc)
+        
+        return total_reward
 
     # ===================== 2. LLM 调用封装 =====================
 
@@ -88,192 +130,233 @@ class TF_GRPO:
     # ===================== 3. 核心算子实现 =====================
 
     def batch_summarize(self, question: str, outputs: List[str]) -> Dict[str, Any]:
-            """
-            一次性对 G 条轨迹进行分别总结 + 整体总结。
-            返回格式:
-            {
-                "individual_summaries": ["summary_for_trace_1", "summary_for_trace_2", ...],
-                "overall_summary": "summary_for_all"
-            }
-            """
-            # 构建输入文本，标记清楚每一条轨迹
             traces_text = ""
             for i, out in enumerate(outputs):
-                # 为了防止 prompt 过长，可以适当截断每条轨迹（例如前2000字符）
-                traces_text += f"--- [Attempt {i+1}] ---\n{out}\n\n"
+                traces_text += f"--- [Attempt {i+1}] ---\n{out}...\n\n" # 简单截断防止过长
 
             prompt = (
                 f"Problem: {question}\n\n"
                 f"Here are {len(outputs)} different attempts to solve this problem:\n"
                 f"{traces_text}\n"
                 "--- TASK ---\n"
-                "1. Analyze each attempt INDIVIDUALLY: Summarize its method and identify key errors or success factors (2-3 sentences each).For example, 'In attempt 1, the agent...'.\n"
-                "2. Analyze ALL attempts COLLECTIVELY: Provide a brief overall summary and precautions for this problem type.\n\n"
+                "1. Analyze each attempt INDIVIDUALLY: Summarize method and errors using about 2-4 sentences.\n"
+                "2. Analyze ALL attempts COLLECTIVELY: Provide overall insight.\n\n"
                 "--- OUTPUT FORMAT ---\n"
-                "Return a strictly valid JSON object with exactly two keys:\n"
+                "Return JSON:\n"
                 "{\n"
                 '  "individual_summaries": ["summary 1", "summary 2", ...],\n'
-                '  "overall_summary": "your overall insight string"\n'
+                '  "overall_summary": "overall insight"\n'
                 "}"
             )
-            
             messages = [{"role": "user", "content": prompt}]
-            
-            # 强制 JSON 模式
             res = self.call_llm(messages, temperature=0.7, json_mode=True)
-            
             try:
                 data = json.loads(res)
-                # 简单的校验，确保返回列表长度对得上
                 if not isinstance(data.get("individual_summaries"), list):
-                    data["individual_summaries"] = ["Error parsing summary"] * len(outputs)
+                    data["individual_summaries"] = ["Error parsing"] * len(outputs)
                 return data
-            except json.JSONDecodeError:
-                print("[Batch Summarize] JSON parsing failed.")
-                return {
-                    "individual_summaries": ["Summary failed"] * len(outputs),
-                    "overall_summary": "Summary failed"
-                }
+            except:
+                return {"individual_summaries": ["Summary failed"]*len(outputs), "overall_summary": "Summary failed"}
 
-    def exp_controller(self, question: str, old_exps: List[str], observations: List[Dict]) -> List[str]:
-        e_text = json.dumps(old_exps, indent=1) if old_exps else "[] (No prior experience)"
+    def exp_controller(self, question: str, old_exps: List[Dict[str, Any]], observations: List[Dict]) -> List[Dict[str, Any]]:
+        """
+        Input old_exps format: [{"text": "...", "score": 1.2}, ...]
+        Returns updated experience list with same length as observations.
+        """
+        target_count = len(observations)
+
+        # === 1. 将旧经验序列化为可视化更强的格式 (Attempt X / Overall Summary) ===
+        formatted_old_exps = []
+        if old_exps:
+            for i, exp in enumerate(old_exps):
+                # 最后一个默认为 overall summary，前面的为 attempt
+                key = "overall summary" if i == len(old_exps) - 1 else f"attempt{i+1}"
+                formatted_old_exps.append({
+                    key: exp.get("text", ""),
+                    "score": exp.get("score", 0.0)
+                })
+            e_text = json.dumps(formatted_old_exps, indent=1)
+        else:
+            e_text = "[] (No prior experience)"
+        
         obs_text = ""
         for i, obs in enumerate(observations):
-            if i != len(observations) - 1:
-                obs_text += (
-                    f"[Attempt {i+1}]\n"
-                    f"Advantage Score: {obs['advantage']:.4f}\n"
-                    f"Summary: {obs['summary']}\n\n"
-                )
-            else:  # 最后一个是整体总结
-                obs_text += (
-                    f"[Overall Summary]\n"
-                    f"Advantage Score: {obs['advantage']:.4f}\n"
-                    f"Summary: {obs['summary']}\n\n"
-                )
+            prefix = f"[Attempt {i+1}]" if i != len(observations)-1 else "[Overall Summary]"
+            obs_text += (
+                f"{prefix}\n"
+                f"Advantage Score: {obs['advantage']:.4f}\n"
+                f"Summary: {obs['summary']}\n\n"
+            )
+
         system_prompt = "You are a meta-learning optimizer for math reasoning."
         user_prompt = (
             f"Current Problem: {question}\n\n"
-            f"=== OLD EXPERIENCE BANK (E) ===\n{e_text}\n\n"
-            f"=== NEW OBSERVATIONS (from current G={self.group_size} rollouts) ===\n{obs_text}\n\n"
+            f"=== OLD EXPERIENCE BANK (With Advantage Scores) ===\n{e_text}\n\n"
+            f"=== NEW OBSERVATIONS (G={self.group_size} rollouts + 1 global) ===\n{obs_text}\n\n"
             "=== INSTRUCTIONS ===\n"
-            "Use the Advantage Scores (A_i) to refine the Experience Bank(Experience Bank's attempts'number should be equal to G):\n"
-            "1. **KEEP**: Retain old experiences that align with high-advantage attempts.\n"
-            "2. **MODIFY**: Correct an old experience if a high-advantage attempt shows a better way.\n"
-            "3. **DELETE**: Remove experiences that led to low-advantage outcomes.\n"
-            "4. **ADD**: Extract new insights from high-advantage attempts.\n\n"
-            "5. **IMPROVEMENT**: Revise the Overall Summary.\n\n" 
-            "Output the updated list of experiences as a JSON object: {\"experiences\": [\"exp1\", \"exp2\"]}"
+            "Refine the Experience Bank based on the new Advantage Scores.\n"
+            f"IMPORTANT: You MUST output exactly {target_count} experience items.\n"
+            "1. **KEEP/MODIFY**: Retain or improve experiences from high-advantage attempts.\n"
+            "2. **DELETE**: Remove experiences linked to negative advantages.\n"
+            "3. **ADD**: Extract new insights from high-advantage attempts.\n"
+            "4. **ASSIGN SCORE**: For each experience, assign a 'score' equal to the Advantage of the attempt it was derived from.\n\n"
+            "Output strictly valid JSON (standard 'text' key is fine for output, I will format it later):\n"
+            "{\n"
+            "  \"experiences\": [\n"
+            "    {\"text\": \"Use method X...\", \"score\": 0.85},\n"
+            "    {\"text\": \"Avoid error Y...\", \"score\": -0.5}\n"
+            "  ]\n"
+            "}"
         )
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
-        res = self.call_llm(messages, temperature=0.2, json_mode=True)
+        res = self.call_llm(messages, temperature=0.7, json_mode=True)
+        
+        default_item = {"text": "Think clearly and step by step.", "score": 0.0}
+        
         try:
             data = json.loads(res)
             new_exps = data.get("experiences", [])
-            return [str(e) for e in new_exps if isinstance(e, str)]
-        except:
-            return old_exps
+            
+            # 格式清洗
+            cleaned_exps = []
+            for item in new_exps:
+                if isinstance(item, dict) and "text" in item:
+                    if "score" not in item: item["score"] = 0.0
+                    cleaned_exps.append(item)
+                elif isinstance(item, str):
+                    cleaned_exps.append({"text": item, "score": 0.0})
+            
+            # 长度强制对齐
+            current_len = len(cleaned_exps)
+            
+            if current_len == target_count:
+                return cleaned_exps
+            elif current_len > target_count:
+                return cleaned_exps[:target_count]
+            else:
+                missing = target_count - current_len
+                if len(old_exps) >= target_count:
+                    cleaned_exps.extend(old_exps[current_len:target_count])
+                else:
+                    filler = cleaned_exps[-1] if cleaned_exps else default_item
+                    cleaned_exps.extend([filler.copy() for _ in range(missing)])
+                return cleaned_exps
+
+        except Exception as e:
+            print(f"[Exp Controller Error] {e}")
+            if len(old_exps) == target_count: return old_exps
+            if len(old_exps) > target_count: return old_exps[:target_count]
+            return old_exps + [default_item] * (target_count - len(old_exps))
 
     # ===================== 4. 主训练循环 =====================
 
     def train_loop(self, parquet_path: str, epochs=3, sample_size=100):
         import pandas as pd
         
-        # ====== 修改部分：随机采样与 Dataset 持久化逻辑 ======
         if self.dataset:
             print(f"[TF-GRPO] Using existing dataset with {len(self.dataset)} samples.")
         else:
             print(f"[TF-GRPO] Loading dataset from {parquet_path}...")
             df = pd.read_parquet(parquet_path)
             records = df.to_dict(orient="records")
-            
-            # 随机抽取 sample_size 道题
-            # 如果原始数据不够，则全量使用
             actual_size = min(sample_size, len(records))
             self.dataset = random.sample(records, actual_size)
-            print(f"[TF-GRPO] Randomly sampled {actual_size} problems. Dataset initialized.")
-        # =================================================
+            print(f"[TF-GRPO] Randomly sampled {actual_size} problems.")
 
         for ep in range(epochs):
             print(f"\n{'='*20} Epoch {ep+1}/{epochs} {'='*20}")
             
-            # 遍历 dataset
             for idx, item in enumerate(tqdm(self.dataset)):
-                
-                # 数据解析
                 q, gold = item["prompt"][0]["content"], item["reward_model"]["ground_truth"]
 
-                # 1. 提取经验 (按 idx 顺序提取)
+                # 1. 提取经验
                 current_experiences = self.experience_bank.get(idx, [])
                 
-                # 2. Rollout
                 if current_experiences:
-                    exp_str = "\n".join([f"{i+1}. {e}" for i, e in enumerate(current_experiences)])
+                    exp_lines = []
+                    for i, e in enumerate(current_experiences):
+                        text = e.get("text", "")
+                        score = e.get("score", 0.0)
+                        exp_lines.append(f"{i+1}. {text} (Confidence: {score:.2f})")
+                    
+                    exp_str = "\n".join(exp_lines)
                     system_content = (
                         "You are a math problem solver. "
-                        "Please refer to the following historical experiences to solve this problem:\n"
+                        "Please refer to the following historical experiences (with confidence scores) to solve this problem:\n"
                         f"{exp_str}\n\n"
                         "Think step by step."
                     )
                 else:
                     system_content = "You are a math problem solver. Think step by step."
 
-                messages = [{"role": "system", 
-                             "content": system_content}, 
-                            {"role": "user", 
-                             "content": f"Problem: {q}\n"}]
+                messages = [{"role": "system", "content": system_content}, 
+                            {"role": "user", "content": f"Problem: {q}\n"}]
                 
+                # 2. Rollout
                 outputs = []
                 for _ in range(self.group_size):
                     outputs.append(self.call_llm(messages, temperature=0.7))
 
                 # 3. Advantage
-                rewards = [self.check_correctness(o, gold) for o in outputs]
+                rewards = [self.compute_composite_reward(o, gold) for o in outputs]
                 advantages = self.compute_advantages(rewards)
 
-                # 4. Batch Summarization (1次 API 调用)
-                
-                # 只要有不一致的Reward，或者为了积累经验，就进行总结
-                # 这里建议始终进行，或者根据需求加 if 判断
+                # 4. Summarize & Update
                 summary_result = self.batch_summarize(q, outputs)
-                
-                individual_summaries = summary_result.get("individual_summaries", [])
-                overall_summary = summary_result.get("overall_summary", "")
+                indiv_sums = summary_result.get("individual_summaries", [])
+                overall_sum = summary_result.get("overall_summary", "")
 
-                # 补齐数据（防止模型返回的列表长度不够）
-                if len(individual_summaries) < self.group_size:
-                    individual_summaries.extend([""] * (self.group_size - len(individual_summaries)))
+                if len(indiv_sums) < self.group_size:
+                    indiv_sums.extend([""] * (self.group_size - len(indiv_sums)))
 
                 observations = []
-                
-                # A. 填入个体总结
                 for i in range(self.group_size):
-                    observations.append({
-                        "summary": individual_summaries[i], 
-                        "advantage": advantages[i]
-                    })
+                    observations.append({"summary": indiv_sums[i], "advantage": advantages[i]})
                 
-                # B. 填入整体总结
-                # 整体总结的 advantage 给平均分
-                avg_advantage = statistics.mean(advantages) if advantages else 0.0
-                observations.append({
-                    "summary": f"[Global Insight] {overall_summary}", 
-                    "advantage": avg_advantage
-                })
-                # 调用 Controller 更新
+                avg_adv = statistics.mean(advantages) if advantages else 0.0
+                observations.append({"summary": f"[Global] {overall_sum}", "advantage": avg_adv})
+
                 updated_experiences = self.exp_controller(q, current_experiences, observations)
                 self.experience_bank[idx] = updated_experiences
-                print(f" Problem {idx}: Updated Experience Bank: {updated_experiences}")
+                print(f"problem{idx+1}:{updated_experiences}")
 
-                # Debug print
                 if (idx + 1) % 10 == 0:
-                    print(f" Problem {idx+1}: AvgReward={avg_advantage}")
+                    print(f" Problem {idx+1}: AvgReward={avg_adv:.2f}")
 
-            # 保存 Epoch 结果
-            with open(f"experience_bank_epoch_{ep+1}.json", "w") as f:
-                dump_data = [{"index": k, "experiences": v} for k, v in self.experience_bank.items()]
-                json.dump(dump_data, f, indent=2)
+            # === 保存逻辑更新：格式化为指定结构 ===
+            print(f"Saving Experience Bank for Epoch {ep+1}...")
+            save_data = []
+            for idx, exps in self.experience_bank.items():
+                # 获取问题文本 (防御性编程：确保索引存在)
+                if idx < len(self.dataset):
+                    prob_text = self.dataset[idx]["prompt"][0]["content"]
+                else:
+                    prob_text = "Unknown Problem"
+
+                # 转换 experiences 列表为带 attempt 键的格式
+                formatted_exps = []
+                for i, e in enumerate(exps):
+                    # 判断是 attempt 还是 overall summary (最后一条)
+                    if i == len(exps) - 1:
+                        key_name = "overall summary"
+                    else:
+                        key_name = f"attempt{i+1}"
+                    
+                    formatted_exps.append({
+                        key_name: e.get("text", ""),
+                        "score": e.get("score", 0.0)
+                    })
+                
+                save_data.append({
+                    "problem": prob_text,
+                    "experiences": formatted_exps
+                })
+
+            with open(f"experience_bank_epoch_{ep+1}.json", "w", encoding='utf-8') as f:
+                json.dump(save_data, f, indent=2, ensure_ascii=False)
+
+
