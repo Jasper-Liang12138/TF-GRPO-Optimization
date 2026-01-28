@@ -12,10 +12,8 @@ python RLHF/math_inference.py \
     --model_name deepseek-chat \
     --dataset AQuA \
     --data_path /root/autodl-tmp/LLM_Adapters/LLM_Adapters/TF-GRPO-EXP/dataset/AQuA/test.json \
-    --exp_size 100 \
-    --group_size 4 \
-    --save_path /root/autodl-tmp/LLM_Adapters/LLM_Adapters/TF-GRPO-EXP/math_inference_results/AQuA_deepseek-chat_100_4.json \
-    --experience_bank_path /root/autodl-tmp/LLM_Adapters/LLM_Adapters/TF-GRPO-EXP/experience_bank_ep.json
+    --save_path /root/autodl-tmp/LLM_Adapters/LLM_Adapters/TF-GRPO-EXP/math_inference_results/AQuA_deepseek-chat_100_4_3.json \
+    --experience_bank_path /root/autodl-tmp/LLM_Adapters/LLM_Adapters/TF-GRPO-EXP/experience_bank_epoch_3.json \
     --IF_TF_GRPO_MODE
     
 python RLHF/math_inference.py \
