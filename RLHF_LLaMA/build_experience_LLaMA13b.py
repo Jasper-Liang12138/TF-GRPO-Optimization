@@ -1,155 +1,88 @@
-import sys
-import os
-import re
 import argparse
-from tqdm import tqdm
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, PreTrainedTokenizerFast
-from tf_grpo_gptoss120b import TF_GRPO
+import os
+import sys
 
-
-# 假设 inference_math.py 在 LLM_Adapters/RLHF/ 下
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
-sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
-
-if torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = "cpu"
 
 try:
-    if torch.backends.mps.is_available():
-        device = "mps"
-except:  # noqa: E722
-    pass
+    from tf_grpo_LLaMA13b import TF_GRPO
+except ImportError:
+    print("Error: Could not import 'TF_GRPO_Local' from 'tf_grpo.py'.")
+    print("Please make sure the class file is named 'tf_grpo.py' and is in the same directory.")
+    sys.exit(1)
 
-
-# ====================== 参数解析 ======================
-def parse_args():
-    parser = argparse.ArgumentParser("TF-GRPO Inference on AQuA")
-
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Base LLM, e.g. openai/gpt-oss-120b",
-    )
-    parser.add_argument(
-        "--dapo_parquet",
-        type=str,
-        required=True,
-        help="DAPO-Math-17K parquet (used only to build experience bank)",
-    )
-    parser.add_argument(
-        "--exp_size",
-        type=int,
-        default=100,
-        help="Number of DAPO samples to build experience bank",
-    )
-    parser.add_argument(
-        "--group_size",
-        type=int,
-        default=8,
-        help="Group rollout size for TF-GRPO",
-    )
-    parser.add_argument(
-        "--load_8bit",
-        default=False,
-        action="store_true",
-        help="Load model in 8-bit precision to save GPU memory",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=512,
-        help="Maximum number of new tokens to generate per step",
-    )
-
-    return parser.parse_args()
-
-def load_model(args) -> tuple:
-    """
-    load tuned model
-    Args:
-        args:
-
-    Returns:
-        tuple(tokenizer, model)
-    """
-    base_model = args.model
-    if not base_model:
-        raise ValueError(f'can not find base model name by the value: {args.model}')
-
-    load_8bit = args.load_8bit
-    if args.model == 'LLaMA-7B':
-        tokenizer = LlamaTokenizer.from_pretrained(base_model)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-    if device == "cuda":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            torch_dtype=torch.bfloat16,   # A800 推荐使用 bf16
-            attn_implementation="sdpa"
-        ) 
-       
-    elif device == "mps":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            device_map={"": device},
-            torch_dtype=torch.float16,
-        )
-       
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model, device_map={"": device}, low_cpu_mem_usage=True
-        )
-
-        # unwind broken decapoda-research config
-        model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
-        model.config.bos_token_id = 1
-        model.config.eos_token_id = 2
-
-        if not load_8bit:
-            model.half()  # seems to fix bugs for some users.
-
-        model.eval()
-        if torch.__version__ >= "2" and sys.platform != "win32":
-            model = torch.compile(model)
-
-    return tokenizer, model
-
-# ====================== main ======================
 def main():
-    torch.cuda.empty_cache()
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Run Training-Free GRPO on Math Datasets (Local vLLM)")
+    
+    # === 必需参数 ===
+    parser.add_argument("--data_path", type=str, required=True, 
+                        help="Path to the input dataset file (.parquet, .json, or .jsonl)")
+    
+    # === 模型与硬件参数 ===
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-13b-chat-hf", 
+                        help="Hugging Face Model ID or local path (default: Llama-2-13b)")
+    parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=2, dest="tp",
+                        help="Number of GPUs to use for Tensor Parallelism (default: 2)")
+    
+    # === 算法超参数 ===
+    parser.add_argument("--group_size", type=int, default=4, 
+                        help="Group size (G) for GRPO sampling (default: 4)")
+    parser.add_argument("--epochs", type=int, default=3, 
+                        help="Number of refinement epochs (default: 3)")
+    parser.add_argument("--sample_size", type=int, default=100, 
+                        help="Number of problems to sample from dataset (default: 100)")
+    parser.add_argument("--max_new_tokens", type=int, default=2048, 
+                        help="Max new tokens for generation (default: 2048)")
+    
+    # === 输出配置 ===
+    parser.add_argument("--output_dir", type=str, default="./output_logs", 
+                        help="Directory to save experience banks and logs")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[Device] {device}")
+    args = parser.parse_args()
 
-    # ========== Load model ==========
-    print("[Load] Base model")
-    tokenizer, model = load_model(args)
+    # 1. 检查数据路径
+    if not os.path.exists(args.data_path):
+        print(f"Error: Data file not found at {args.data_path}")
+        return
 
-    # ========== Init TF-GRPO ==========
-    tf_grpo = TF_GRPO(
-        model=model,
-        tokenizer=tokenizer,
-        group_size=args.group_size,
-        max_experiences=args.exp_size,
-        max_new_tokens=args.max_new_tokens
+    print(f"\n{'='*10} Starting TF-GRPO (Local) {'='*10}")
+    print(f"Model ID     : {args.model}")
+    print(f"GPUs (TP)    : {args.tp}")
+    print(f"Data Path    : {args.data_path}")
+    print(f"Sample Size  : {args.sample_size}")
+    print(f"Group Size   : {args.group_size}")
+    print(f"Epochs       : {args.epochs}")
+    print(f"Output Dir   : {args.output_dir}")
+    print(f"{'='*32}\n")
+
+    # 2. 初始化 Agent (vLLM加载在这一步发生)
+    # 注意：这里调用的是 TF_GRPO 类
+    try:
+        agent = TF_GRPO(
+            model_name=args.model,
+            group_size=args.group_size,
+            max_new_tokens=args.max_new_tokens,
+            tensor_parallel_size=args.tp,
+            # 如果你的类没有 output_dir 参数，请删除下面这行；
+            # 但建议在类里加上 output_dir 以便管理输出路径
+            output_dir=args.output_dir 
+        )
+    except TypeError:
+        # 兼容旧版本如果不接受 output_dir 的情况
+        agent = TF_GRPO(
+            model_name=args.model,
+            group_size=args.group_size,
+            max_new_tokens=args.max_new_tokens,
+            tensor_parallel_size=args.tp
+        )
+
+    # 3. 开始训练循环
+    agent.train_loop(
+        parquet_path=args.data_path, 
+        epochs=args.epochs, 
+        sample_size=args.sample_size
     )
-
-    # ========== Build Experience Bank ==========
-    print("Build Experience Bank from DAPO")
-    tf_grpo.build_experience_from_dapo_epochs(
-        parquet_path=args.dapo_parquet,
-        sample_size=args.exp_size,
-    )
-
-    print("\nBuild finished")
-
-
+    
+    print("\n>>> TF-GRPO Process Finished. <<<")
 
 if __name__ == "__main__":
     main()

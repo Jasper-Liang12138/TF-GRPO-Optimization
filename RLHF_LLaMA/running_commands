@@ -1,21 +1,19 @@
-CUDA_VISIBLE_DEVICES=0 python RLHF/build_experience_gptoss120b.py \
-  --model openai/gpt-oss-120b \
-  --dapo_parquet dataset/dapo-math-17k.parquet \
-  --exp_size 100 \
-  --group_size 4 \
-  --max_new_tokens 512
+export CUDA_VISIBLE_DEVICES=0,1
 
-python RLHF/math_inference.py \
+python RLHF_LLaMA/build_experience_LLaMA13b.py \
+    --data_path /root/autodl-tmp/LLM_Adapters_fork/dataset/dapo-math-17k.parquet \
     --model yahma/llama-7b-hf \
-    --aqua_path dataset/AQuA/test.json \
-    --experience_bank_path RLHF/experience_bank.json \
-    --save_path experiment/tf_grpo_aqua_results.json
-    
-python RLHF/math_inference.py \
-  --model yahma/llama-7b-hf \
-  --dataset SVAMP \
-  --dapo_parquet dataset/dapo-math-17k.parquet \
-  --experience_bank_path RLHF/experience_bank.json \
-  --save_path experiment/tf_grpo_aqua_results.json \
-  --group_size 3 \
-  --max_new_tokens 128
+    --tp 2 \
+    --group_size 4 \
+    --sample_size 100 \
+    --epochs 3 \
+    --output_dir ./RLHF_LLaMA/experiences_bank_LLaMA13b
+
+
+python RLHF_LLaMA/math_inference_llama13b.py \
+    --model meta-llama/Llama-2-13b-chat-hf \
+    --tp 2 \
+    --dataset gsm8k \
+    --data_path ./dataset/gsm8k/test.json \
+    --experience_bank_path ./experience_bank.json \
+    --save_path ./output/gsm8k_ood_results.json

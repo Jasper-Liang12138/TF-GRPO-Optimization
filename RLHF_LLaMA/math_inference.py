@@ -2,372 +2,308 @@ import json
 import sys
 import os
 import re
-import copy
 import argparse
-import random
-from tqdm import tqdm
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer
-from tf_grpo_gptoss120b import TF_GRPO
+from tqdm import tqdm
+from typing import List, Dict, Any
+from tf_grpo_LLaMA13b import TF_GRPO
 
-# 假设 inference_math.py 在 LLM_Adapters/RLHF/ 下
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
-sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
+# === 引入 vLLM 相关库 ===
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
 
-if torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = "cpu"
-
-try:
-    if torch.backends.mps.is_available():
-        device = "mps"
-except:  # noqa: E722
-    pass
-
-# ====================== 答案抽取 ======================
+# ====================== 1. 答案抽取辅助函数 (保持原逻辑) ======================
 def extract_answer_letter(sentence: str) -> str:
-    """
-    多选题（目前仅 AQuA）选项字母抽取逻辑，参考 evaluate.py：
-    - 直接从文本中抽取 A-E，第一个匹配即为预测。
-    """
+    """针对 AQuA 等选择题提取 A-E"""
     sentence_ = sentence.strip()
-    pred_answers = re.findall(r"A|B|C|D|E", sentence_)
-    if pred_answers:
-        return pred_answers[0]
+    # 1. 优先匹配标准的 "Answer: X" 格式
+    matches = re.findall(r"Answer\s*:\s*([A-E])", sentence_, re.IGNORECASE)
+    if matches:
+        return matches[-1].upper()
+
+    # 2. 保底策略：提取文本中最后出现的独立字母 A-E
+    fallback_matches = re.findall(r"\b([A-E])\b", sentence_)
+    if fallback_matches:
+        return fallback_matches[-1].upper()
     return ""
 
-
 def extract_answer_number(sentence: str) -> float:
-    """
-    数值型答案抽取逻辑，参考 evaluate.py：
-    - 去掉逗号
-    - 正则抓取所有数字/小数，取最后一个
-    - 解析失败或不存在时返回 inf，方便后续判错
-    """
-    sentence = sentence.replace(",", "")
-    preds = re.findall(r"-?\d+\.?\d*", sentence)
-    if not preds:
-        return float("inf")
-    try:
-        pred_answer = float(preds[-1])
-    except ValueError:
-        return float("inf")
-    return pred_answer
+    """针对 GSM8K 等数值题提取数字"""
+    # 优先寻找 \boxed{}
+    boxed_match = re.search(r"\\boxed\{([^{}]+)\}", sentence)
+    if boxed_match:
+        text_to_parse = boxed_match.group(1)
+    else:
+        # 移除逗号，从最后一行找
+        text_to_parse = sentence.replace(",", "")
+    
+    preds = re.findall(r"-?\d+\.?\d*", text_to_parse)
+    if not preds: return float("inf")
+    try: return float(preds[-1])
+    except ValueError: return float("inf")
 
-
-def is_choice_dataset(dataset: str) -> bool:
+# ====================== 2. 经验库格式化 (保持原逻辑) ======================
+def format_experience_bank(experience_data: List[dict]) -> str:
     """
-    当前只有 AQuA 是多选题，需要输出选项字母；其他数据集默认输出数值。
+    将结构化的经验库转换为 Prompt 友好的文本格式。
+    保留问题上下文、经验类型（attempt/summary）和评分。
     """
-    return dataset.lower() == "aqua"
+    formatted_blocks = []
+    
+    for idx, entry in enumerate(experience_data):
+        # 1. 获取问题文本
+        problem_text = entry.get("problem", "").strip()
+        experiences = entry.get("experiences", [])
+        
+        if not experiences:
+            continue
 
+        # 2. 构建单个案例块
+        block_lines = []
+        block_lines.append(f"=== [Case Study {idx + 1}] ===")
+        block_lines.append(f"Problem: {problem_text}") 
+        block_lines.append("Reference Insights:")
 
-def build_aqua_prompt(question_with_choices: str) -> str:
-    """
-    AQuA 是多选题，题干里通常包含 Answer Choices。
-    强制模型只输出选项字母，避免输出空的 Answer: 或输出数值。
-    """
-    return (
-        "Solve the following multiple-choice math problem.\n"
-        "Pick exactly one option from {A, B, C, D, E}.\n"
-        "Do NOT output the option text.\n"
-        "Your output must end with exactly one line:\n"
-        "Answer: <A/B/C/D/E>\n\n"
-        f"Problem:\n{question_with_choices}\n"
-    )
+        # 3. 遍历该问题下的所有经验条目
+        has_content = False
+        for exp_item in experiences:
+            # 兼容不同格式的 key
+            score = exp_item.get("score", 0.0)
+            content = ""
+            label = "Insight"
+            
+            # 寻找非 score 的键作为内容
+            for k, v in exp_item.items():
+                if k != "score" and isinstance(v, str) and v.strip():
+                    label = k  # e.g., "attempt1", "overall summary"
+                    content = v
+                    break
+            
+            # 策略：全量拼接时，通常只保留正向经验 (Score > 0)
+            if content and score > 0:
+                block_lines.append(f"  * [{label}] (Confidence: {score:.2f}): {content}")
+                has_content = True
 
+        if has_content:
+            formatted_blocks.append("\n".join(block_lines))
 
-# ====================== 参数解析 ======================
+    return "\n\n".join(formatted_blocks)
+    def __init__(self, model_name: str, tensor_parallel_size: int = 2):
+        print(f"[Init] Loading vLLM Model: {model_name} (TP={tensor_parallel_size})")
+        
+        # 初始化 vLLM
+        self.llm = LLM(
+            model=model_name,
+            tensor_parallel_size=tensor_parallel_size,
+            trust_remote_code=True,
+            gpu_memory_utilization=0.90,
+            dtype="bfloat16", # A800 推荐 bf16
+            enforce_eager=False
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.global_experiences_text = ""
+
+    def load_experience_bank(self, path: str):
+        """加载并全量格式化经验库"""
+        if not path or not os.path.exists(path):
+            print("[Warning] Experience bank path invalid. Running Zero-shot.")
+            return
+
+        print(f"[Step 1] Loading Experience Bank from {path}")
+        try:
+            with open(path, "r", encoding='utf-8') as f:
+                raw_data = json.load(f)
+            
+            print(f"Loaded {len(raw_data)} cases.")
+            self.global_experiences_text = format_experience_bank(raw_data)
+            
+            # Token 长度检查与预警
+            token_len = len(self.tokenizer.encode(self.global_experiences_text))
+            print(f"[Info] Total Experience Context Length: ~{token_len} tokens")
+            if token_len > 3000:
+                print("[Warning] Experience context is very long! It may truncate the problem.")
+                
+        except Exception as e:
+            print(f"[Error] Failed to format experience bank: {e}")
+
+    def build_messages(self, question: str, is_aqua: bool = False) -> List[Dict]:
+        """构建 Chat 格式的消息列表"""
+        
+        # 1. System Prompt (包含全量经验)
+        if is_aqua:
+            base_instruction = (
+                "You are a math problem solver. Please Solve the following multiple-choice math problem. "
+                "Pick exactly one option from {A, B, C, D, E}. Answer: <A/B/C/D/E>"
+            )
+        else:
+            base_instruction = "You are an advanced math problem solver. Solve the problem step by step."
+
+        system_content = f"{base_instruction}\n\n"
+
+        if self.global_experiences_text:
+            system_content += (
+                "### LEARNING FROM HISTORY\n"
+                "Below are historical problems and the insights/experiences derived from them.\n"
+                "Pay attention to the 'Confidence' scores. High confidence means the insight was verified as highly effective.\n\n"
+                f"{self.global_experiences_text}\n\n"
+                "### YOUR TASK\n"
+                "Refer to the logic and insights from the cases above to solve the new problem.\n"
+                "Use the insights to help you, but do NOT copy them verbatim.\n"
+            )
+
+        # 2. User Prompt
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"Current Problem: {question}\n"}
+        ]
+        return messages
+
+    def generate_one(self, messages: List[Dict], max_tokens: int = 2048) -> str:
+        """单次贪婪生成"""
+        # 应用 Chat Template
+        try:
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except:
+            # 兜底：简单拼接
+            prompt = ""
+            for m in messages:
+                prompt += f"{m['role'].upper()}: {m['content']}\n"
+            prompt += "ASSISTANT:"
+
+        sampling_params = SamplingParams(
+            temperature=0.0, # Greedy Decoding for OOD stability
+            max_tokens=max_tokens,
+            top_p=1.0
+        )
+        
+        outputs = self.llm.generate([prompt], sampling_params, use_tqdm=False)
+        return outputs[0].outputs[0].text.strip()
+
+# ====================== 4. 参数解析与主流程 ======================
+
 def parse_args():
-    parser = argparse.ArgumentParser("TF-GRPO Inference on Math Datasets")
+    parser = argparse.ArgumentParser("TF-GRPO Local Inference (LLaMA-13B)")
+    
+    # 硬件与模型
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-13b-chat-hf", help="HuggingFace Model ID")
+    parser.add_argument("--tp", type=int, default=2, help="Tensor Parallel Size (Cards)")
+    
+    # 数据
+    parser.add_argument("--dataset", type=str, default="AQuA", choices=["AQuA", "gsm8k", "SVAMP", "math"])
+    parser.add_argument("--data_path", type=str, required=True, help="Path to test.json")
+    parser.add_argument("--experience_bank_path", type=str, default=None, help="Path to experience bank json")
+    
+    # 输出
+    parser.add_argument("--save_path", type=str, default="results_local.json")
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--sample_size", type=int, default=-1, help="-1 for all")
 
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Base LLM, e.g. yahma/llama-7b-hf",
-    )
-    # 兼容旧参数：仅 AQuA 使用
-    parser.add_argument(
-        "--aqua_path",
-        type=str,
-        default="dataset/AQuA/test.json",
-        help="(only for AQuA) Path to AQuA test.json",
-    )
-    # 通用数据路径，如果提供则覆盖默认 dataset 路径
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        default=None,
-        help="Path to dataset test.json; if not set, use dataset/{dataset}/test.json "
-             "for non-AQuA datasets and --aqua_path for AQuA.",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="AQuA",
-        choices=["AQuA", "AddSub", "MultiArith", "SingleEq", "gsm8k", "SVAMP", "mawps", "mathqa"],
-        help="Math dataset name. AQuA 输出选项字母，其他数据集输出数值答案。",
-    )
-    parser.add_argument(
-        "--dapo_parquet",
-        type=str,
-        default="dataset/dapo-math-17k.parquet",
-        help="DAPO-Math-17K parquet (used only to build experience bank)",
-    )
-    parser.add_argument(
-        "--exp_size",
-        type=int,
-        default=100,
-        help="Number of DAPO samples to build experience bank",
-    )
-    parser.add_argument(
-        "--group_size",
-        type=int,
-        default=8,
-        help="Group rollout size for TF-GRPO",
-    )
-    parser.add_argument(
-        "--save_path",
-        type=str,
-        default="experiment/tf_grpo_math_results.json",
-        help="Path to save inference results",
-    )
-    parser.add_argument(
-        "--load_8bit",
-        default=False,
-        action="store_true",
-        help="Load model in 8-bit precision to save GPU memory",
-    )
-    parser.add_argument(
-        "--experience_bank_path",
-        type=str,
-        default=None,
-        help="Path to prebuilt experience_bank.json",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=256,
-        help="Maximum number of new tokens to generate per step",
-    )
     return parser.parse_args()
 
-def load_model(args) -> tuple:
-    """
-    load tuned model
-    Args:
-        args:
-
-    Returns:
-        tuple(tokenizer, model)
-    """
-    base_model = args.model
-    if not base_model:
-        raise ValueError(f'can not find base model name by the value: {args.model}')
-
-    load_8bit = args.load_8bit
-    if args.model == 'LLaMA-7B':
-        tokenizer = LlamaTokenizer.from_pretrained(base_model)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-    if device == "cuda":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            torch_dtype=torch.bfloat16,   # A800 推荐 bf16
-            attn_implementation="sdpa"
-        ) 
-       
-    elif device == "mps":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            device_map={"": device},
-            torch_dtype=torch.float16,
-        )
-       
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model, device_map={"": device}, low_cpu_mem_usage=True
-        )
-
-        # unwind broken decapoda-research config
-        model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
-        model.config.bos_token_id = 1
-        model.config.eos_token_id = 2
-
-        if not load_8bit:
-            model.half()  # seems to fix bugs for some users.
-
-        model.eval()
-        if torch.__version__ >= "2" and sys.platform != "win32":
-            model = torch.compile(model)
-
-    return tokenizer, model
-
-# ====================== main ======================
 def main():
-    torch.cuda.empty_cache()
     args = parse_args()
 
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[Device] {device}")
-
-    # ========== Load model ==========
-    print("[Load] Base model")
-    tokenizer, model = load_model(args)
-
-    # ========== Init TF-GRPO ==========
-    tf_grpo = TF_GRPO(
-        model=model,
-        tokenizer=tokenizer,
-        group_size=args.group_size,
-        max_experiences=args.exp_size,
-        max_new_tokens=args.max_new_tokens
+    # 1. 初始化 Agent
+    agent = TF_GRPO(
+        model_name=args.model,
+        tensor_parallel_size=args.tp
     )
 
-    # ========== Load or Build Experience Bank ==========
-    if args.experience_bank_path and os.path.exists(args.experience_bank_path):
-        print(f"[Step 1] Load Experience Bank from {args.experience_bank_path}")
-        with open(args.experience_bank_path, "r") as f:
-            experience_bank_data = json.load(f)
-        tf_grpo.load_experience_bank(experience_bank_data)  # 假设 TF_GRPO 有 load_experience_bank 方法
-    else:
-        print("[Step 1] Build Experience Bank from DAPO")
-        tf_grpo.build_experience_from_dapo_epochs(
-            parquet_path=args.dapo_parquet,
-            sample_size=args.exp_size,
-        )
+    # 2. 加载经验库 (如果路径存在)
+    if args.experience_bank_path:
+        agent.load_experience_bank(args.experience_bank_path)
 
-    # ========== Load dataset ==========
-    if args.data_path:
-        dataset_path = args.data_path
-    else:
-        if is_choice_dataset(args.dataset):
-            dataset_path = args.aqua_path
-        else:
-            dataset_path = os.path.join("dataset", args.dataset, "test.json")
+    # 3. 加载数据集
+    print(f"[Step 2] Load dataset: {args.dataset} from {args.data_path}")
+    data_list = []
+    try:
+        with open(args.data_path, "r") as f:
+            if args.data_path.endswith('.jsonl'):
+                for line in f:
+                    if line.strip(): data_list.append(json.loads(line))
+            else:
+                data_list = json.load(f)
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
 
-    print(f"[Step 2] Load dataset: {args.dataset} from {dataset_path}")
-    with open(dataset_path, "r") as f:
-        dataset = json.load(f)
+    # 采样 (可选)
+    if args.sample_size > 0 and args.sample_size < len(data_list):
+        import random
+        random.seed(42)
+        data_list = random.sample(data_list, args.sample_size)
 
-    # 固定随机种子，保证可复现
-    random.seed(42)
-
-    # 随机抽 100 条（如果不足 100 条则全用）
-    sample_size = min(100, len(dataset))
-    dataset_samples = random.sample(dataset, sample_size)
-
-    total = len(dataset_samples)
+    # 4. 推理循环
+    print(f"[Step 3] Start Inference Loop (Total: {len(data_list)})...")
+    
     correct = 0
     results = []
+    
+    # 确定是否为 AQuA 模式
+    is_aqua = (args.dataset == "AQuA")
 
-    print(f"[Step 3] TF-GRPO inference on {args.dataset}")
+    for idx, data in enumerate(tqdm(data_list)):
+        question = data.get("instruction", "") or data.get("question", "") or data.get("problem", "")
+        gold_answer = data.get("answer", "") or data.get("ground_truth", "")
 
-    # 与 evaluate.py 风格一致的进度条与评价逻辑
-    miss = 1e-3
-    pbar = tqdm(total=total)
-    for idx, data in enumerate(dataset_samples):
-        question = data.get("instruction", "")
+        # 构建 Messages (全量拼接发生在内部)
+        messages = agent.build_messages(question, is_aqua=is_aqua)
 
-        # 获取标签
-        gold_answer = data.get("answer", "")
+        # 调试：打印第一个问题的 Prompt 长度
+        if idx == 0:
+            full_text = messages[0]['content'] + messages[1]['content']
+            print(f"\n[DEBUG] First Problem Prompt Length: {len(agent.tokenizer.encode(full_text))} tokens")
+
+        # 生成
+        output = agent.generate_one(messages, max_tokens=args.max_new_tokens)
+
+        # 评估
+        flag = False
+        pred_val = None
         
-        if is_choice_dataset(args.dataset):
-            # AQuA：多选题 prompt
-            prompt = tf_grpo.build_aqua_prompt(question)
-            top_experiences = tf_grpo.extract_similar_experiences(question, args.group_size)
-            outputs = []  # 用来收集每个经验生成的 output
-            for exp_idx, exp in enumerate(top_experiences, 1):
-                # 每次从 prompt 开始，添加当前经验
-                prompt_with_exp = prompt
-                prompt_with_exp[1]["content"] += "Use the following reasoning experiences internally to help your solution, " \
-                                    "but do NOT copy them verbatim into your answer.\n"
-                prompt_with_exp[1]["content"] += f"[Experience {exp_idx}]\n{exp}\n\n"
-                        
-                out = tf_grpo.batch_group_generate(prompt_with_exp)[0]
-                reasoning = tf_grpo.extract_reasoning_from_output(prompt_with_exp, out)
-                if reasoning:    
-                    outputs.append(reasoning)
-            best = tf_grpo.select_best(outputs, gold_answer) if outputs else prompt
+        if is_aqua:
+            pred_val = extract_answer_letter(output)
+            # 简单的字母比较
+            if pred_val and str(gold_answer).strip():
+                flag = (pred_val == str(gold_answer).strip().upper())
         else:
-            # 其他数学数据集：数值题 prompt
-            prompt = tf_grpo.build_prompt_inference(question)
-            top_experiences = tf_grpo.extract_similar_experiences(question, args.group_size)
-            outputs = []  # 用来收集每个经验生成的 output
-            for exp_idx, exp in enumerate(top_experiences, 1):
-                # 每次从 prompt 开始，添加当前经验
-                prompt_with_exp = prompt
-                prompt_with_exp[1]["content"] += "Use the following reasoning experiences internally to help your solution, " \
-                                          "but do NOT copy them verbatim into your answer."
-                prompt_with_exp[1]["content"] += f"[Experience {exp_idx}]\n{exp}\n\n"
-                        
-                out = tf_grpo.batch_group_generate(prompt_with_exp)[0]
-                reasoning = tf_grpo.extract_reasoning_from_output(prompt_with_exp, out)
-                if reasoning:    
-                    outputs.append(reasoning)
-            best = tf_grpo.select_best(outputs, gold_answer) if outputs else prompt
-
-        if is_choice_dataset(args.dataset):
-            pred = extract_answer_letter(best)
-            flag = (pred == gold_answer)
-        else:
-            # 数值题：将标签转为 float，再与预测数值进行近似比较
-            label_num = gold_answer
-            if isinstance(label_num, str):
-                try:
-                    label_num = float(label_num.replace(",", ""))
-                except ValueError:
-                    label_num = float("inf")
+            # 数值比较
+            pred_val = extract_answer_number(output)
             try:
-                label_num = float(label_num)
-            except (TypeError, ValueError):
-                label_num = float("inf")
+                label_num = float(str(gold_answer).replace(",", ""))
+                if label_num != float("inf") and pred_val != float("inf"):
+                    flag = abs(label_num - pred_val) < 1e-3
+            except:
+                flag = False
 
-            pred_num = extract_answer_number(best)
-            pred = pred_num
-            flag = abs(label_num - pred_num) <= miss
+        if flag: correct += 1
+        
+        # 记录结果
+        current_acc = correct / (idx + 1)
+        res = {
+            "question": question,
+            "gold": gold_answer,
+            "pred": pred_val,
+            "output": output,
+            "flag": flag
+        }
+        results.append(res)
 
-        if flag:
-            correct += 1
+        # 进度条显示
+        if (idx + 1) % 10 == 0:
+            tqdm.write(f"Idx: {idx+1} | Acc: {current_acc:.4f}")
+            # 实时保存
+            with open(args.save_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=4, ensure_ascii=False)
 
-        record = copy.deepcopy(data)
-        record["output_pred"] = best
-        record["pred"] = pred
-        record["flag"] = flag
-        results.append(record)
-
-        print("\n---------------")
-        print(best)
-        print("prediction:", pred)
-        print("answer:", gold_answer)
-        print("---------------")
-        print(
-            f"test:{idx + 1}/{total} | "
-            f"accuracy {correct} {correct / (idx + 1):.4f}"
-        )
-
-        # 与 evaluate.py 一样，每条样本都写一次结果文件
-        with open(args.save_path, "w") as f:
-            json.dump(results, f, indent=4)
-
-        pbar.update(1)
-
-    pbar.close()
-
-    print("\nTest finished")
-    print(f"Final {args.dataset} Accuracy: {correct / total:.4f}")
-    print(f"Results saved to: {args.save_path}")
-
+    # 最终保存
+    print(f"\n{'='*30}")
+    print(f"Final Accuracy: {correct / len(data_list):.4f}")
+    with open(args.save_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+    print(f"Results saved to {args.save_path}")
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
