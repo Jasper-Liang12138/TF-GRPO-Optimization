@@ -1,0 +1,52 @@
+# =============================================================================
+# TF-GRPO-Opt-Baseline 运行命令
+# 模型：Qwen2.5-Math-7B-Instruct（本地）  设备：昇腾 NPU
+# =============================================================================
+
+# ── 构建经验库（使用 parquet 文件）──────────────────────────────────────────
+python build_experience.py \
+    --model Qwen/Qwen2.5-Math-7B-Instruct \
+    --data_path /path/to/dapo-math-17k.parquet \
+    --sample_size 100 \
+    --group_size 4 \
+    --epochs 3 \
+    --max_new_tokens 2048 \
+    --device npu:0 \
+    --output_dir ./output_logs
+
+# ── 构建经验库（自动加载 HuggingFace GSM8K）────────────────────────────────
+python build_experience.py \
+    --model Qwen/Qwen2.5-Math-7B-Instruct \
+    --sample_size 100 \
+    --group_size 4 \
+    --epochs 3 \
+    --device npu:0 \
+    --output_dir ./output_logs
+
+# ── 推理评估（带经验库，TF-GRPO 模式）─────────────────────────────────────
+python math_inference.py \
+    --model Qwen/Qwen2.5-Math-7B-Instruct \
+    --dataset gsm8k \
+    --data_path ./dataset/gsm8k/test.json \
+    --save_path ./results/gsm8k_tfgrpo_baseline.json \
+    --experience_bank_path ./output_logs/experience_bank_epoch_3.json \
+    --device npu:0 \
+    --IF_TF_GRPO_MODE
+
+# ── 推理评估（Zero-shot，对照组）──────────────────────────────────────────
+python math_inference.py \
+    --model Qwen/Qwen2.5-Math-7B-Instruct \
+    --dataset gsm8k \
+    --data_path ./dataset/gsm8k/test.json \
+    --save_path ./results/gsm8k_zeroshot_baseline.json \
+    --device npu:0
+
+# ── AQuA 多选题推理 ───────────────────────────────────────────────────────
+python math_inference.py \
+    --model Qwen/Qwen2.5-Math-7B-Instruct \
+    --dataset AQuA \
+    --data_path ./dataset/AQuA/test.json \
+    --save_path ./results/AQuA_tfgrpo_baseline.json \
+    --experience_bank_path ./output_logs/experience_bank_epoch_3.json \
+    --device npu:0 \
+    --IF_TF_GRPO_MODE

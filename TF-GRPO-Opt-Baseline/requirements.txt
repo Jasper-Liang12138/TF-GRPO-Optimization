@@ -1,0 +1,59 @@
+# =============================================================================
+# TF-GRPO-Opt-Baseline — Conda 虚拟环境依赖
+# 运行环境与 TF-GRPO-Opt 完全相同，共用同一个 conda 虚拟环境即可。
+#
+# 安装步骤（与 TF-GRPO-Opt 完全一致）：
+#
+#   # 1. 创建虚拟环境
+#   conda create -n tfgrpo python=3.10 -y
+#   conda activate tfgrpo
+#
+#   # 2. 安装 CANN（从华为官网下载匹配版本）
+#   #    https://www.hiascend.com/software/cann/community
+#
+#   # 3. 安装 torch + torch_npu（版本须与 CANN 严格匹配）
+#   #    CANN 8.0.x → torch==2.1.0 + torch_npu==2.1.0.postX
+#   #    CANN 8.1.x → torch==2.3.1 + torch_npu==2.3.1
+#   pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+#   pip install torch_npu==2.1.0   # 从 gitee.com/ascend/pytorch/releases 下载 whl
+#
+#   # 4. 安装本文件依赖
+#   pip install -r requirements.txt
+# =============================================================================
+
+# ── HuggingFace 生态 ──────────────────────────────────────────────────────
+transformers>=4.45.0,<5.0.0
+tokenizers>=0.20.0
+accelerate>=0.34.0
+datasets>=2.20.0
+huggingface_hub>=0.24.0
+
+# ── Sentence Transformers（TF-GRPO-Opt 需要，Baseline 不使用但保持环境一致） ──
+sentence-transformers>=2.7.0
+
+# ── 数据处理 ──────────────────────────────────────────────────────────────
+pandas>=2.0.0          # 用于读取 parquet 数据
+pyarrow>=14.0.0        # pandas parquet 后端
+
+# ── 数学答案评测 ──────────────────────────────────────────────────────────
+sympy>=1.12
+
+# ── 科学计算 ──────────────────────────────────────────────────────────────
+numpy>=1.24.0,<2.0.0
+
+# ── 训练工具 ──────────────────────────────────────────────────────────────
+tqdm>=4.66.0
+einops>=0.7.0
+
+# ── 日志与可视化（可选） ──────────────────────────────────────────────────
+tensorboard>=2.14.0
+# wandb>=0.17.0
+
+# =============================================================================
+# 注意事项（与 TF-GRPO-Opt 相同）：
+#
+# 1. torch 与 torch_npu 版本必须严格一致。
+# 2. Qwen2.5-Math-7B-Instruct 权重预下载：
+#    HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen2.5-Math-7B-Instruct
+# 3. 本 Baseline 与 TF-GRPO-Opt 共用同一个 conda 环境（tfgrpo）即可。
+# =============================================================================
