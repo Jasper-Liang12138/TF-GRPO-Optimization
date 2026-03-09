@@ -131,12 +131,33 @@ class TF_GRPO:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        print(f"[TF-GRPO] 加载模型: {model_name}  dtype={self.dtype}  device={device}")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=self.dtype,
-            trust_remote_code=True,
-        ).to(self.device)
+        # 多卡自动分片（支持 72B 等大模型）
+        try:
+            n_npu = torch.npu.device_count()
+        except Exception:
+            n_npu = 0
+        n_gpu = torch.cuda.device_count() if not n_npu else 0
+        n_devices = n_npu or n_gpu
+
+        if n_devices > 1:
+            print(f"[TF-GRPO] 检测到 {n_devices} 张加速卡，使用 device_map='auto' 多卡加载")
+            print(f"[TF-GRPO] 加载模型: {model_name}  dtype={self.dtype}")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype,
+                trust_remote_code=True,
+                device_map="auto",
+            )
+            self._input_device = torch.device(device)  # inputs 入口卡
+        else:
+            print(f"[TF-GRPO] 加载模型: {model_name}  dtype={self.dtype}  device={device}")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype,
+                trust_remote_code=True,
+            ).to(self.device)
+            self._input_device = self.device
+
         self.model.eval()
         print("[TF-GRPO] 模型加载完成。")
 
@@ -246,7 +267,7 @@ class TF_GRPO:
             prompt_text,
             return_tensors="pt",
             padding=False,
-        ).to(self.device)
+        ).to(self._input_device)
 
         max_tok = 2048 if json_mode else self.max_new_tokens
 
@@ -358,8 +379,13 @@ class TF_GRPO:
             "2. **DELETE**: Remove experiences linked to negative advantages.\n"
             "3. **ADD**: Extract new insights from high-advantage attempts.\n"
             "4. **ASSIGN SCORE**: For each experience, assign a 'score' equal to the Advantage of the attempt it was derived from.\n\n"
-            "Output strictly valid JSON ONLY (no other text).\n"
-            "Format: {\"experiences\": [{\"text\": \"<insight>\", \"score\": <float>}, ...]}"
+            "Output strictly valid JSON ONLY (no other text):\n"
+            "{\n"
+            "  \"experiences\": [\n"
+            "    {\"text\": \"Use method X...\", \"score\": 0.85},\n"
+            "    {\"text\": \"Avoid error Y...\", \"score\": -0.5}\n"
+            "  ]\n"
+            "}"
         )
 
         messages = [
@@ -377,11 +403,7 @@ class TF_GRPO:
             if data is None:
                 raise ValueError("JSON 解析失败")
 
-            # 兼容模型直接输出列表的情况
-            if isinstance(data, list):
-                new_exps = data
-            else:
-                new_exps = data.get("experiences", [])
+            new_exps = data.get("experiences", [])
 
             # 格式清洗（与原版一致）
             cleaned: List[Dict] = []

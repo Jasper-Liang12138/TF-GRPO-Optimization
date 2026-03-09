@@ -1,0 +1,88 @@
+# =============================================================================
+# Parameterized Experience TF-GRPO — Conda 虚拟环境依赖
+# 适用于：华为昇腾 NPU + CANN 8.2.RC1 + aarch64 架构
+#
+# !! 注意：服务器 base 环境为 Python 3.13，torch_npu 不支持 3.13，
+# !!       必须新建 Python 3.10 的 conda 虚拟环境。
+#
+# 安装步骤：
+#
+#   # 1. 新建虚拟环境（必须用 Python 3.10，torch_npu 2.4.0 不支持 3.13）
+#   conda create -n tfgrpo python=3.10 -y
+#   conda activate tfgrpo
+#
+#   # 2. CANN 8.2.RC1 已在服务器上安装，跳过此步。
+#   #    若环境变量未自动加载，手动 source：
+#   #    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#
+#   # 3. 安装 PyTorch CPU 版（aarch64）
+#   #    CANN 8.2.RC1 对应 torch 2.4.0 + torch_npu 2.4.0
+#   #
+#   #    方式一：conda-forge（aarch64 aarch64推荐）
+#   conda install pytorch==2.4.0 cpuonly -c conda-forge -y
+#   #
+#   #    方式二：pip（PyTorch 2.4+ 官方索引已包含 aarch64 CPU wheel）
+#   #    pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu
+#
+#   # 4. 安装 torch_npu 2.4.0（从昇腾社区下载 aarch64 whl）
+#   #    下载地址：https://gitee.com/ascend/pytorch/releases/tag/v2.4.0
+#   #    文件名示例：torch_npu-2.4.0-cp310-cp310-linux_aarch64.whl
+#   pip install torch_npu-2.4.0-cp310-cp310-linux_aarch64.whl
+#
+#   # 5. 安装本文件其余依赖
+#   pip install -r requirements.txt
+# =============================================================================
+
+# ── HuggingFace 生态 ──────────────────────────────────────────────────────
+transformers>=4.45.0,<5.0.0
+tokenizers>=0.20.0
+accelerate>=0.34.0
+datasets>=2.20.0
+huggingface_hub>=0.24.0
+
+# ── Sentence Transformers（Encoder，冻结使用） ────────────────────────────
+sentence-transformers>=2.7.0
+
+# ── 数学答案评测 ──────────────────────────────────────────────────────────
+sympy>=1.12
+latex2sympy2>=1.9.1
+
+# ── 科学计算 ──────────────────────────────────────────────────────────────
+numpy>=1.24.0,<2.0.0
+scipy>=1.11.0
+
+# ── 训练工具 ──────────────────────────────────────────────────────────────
+tqdm>=4.66.0
+einops>=0.7.0
+
+# ── 日志与可视化（可选） ──────────────────────────────────────────────────
+# wandb>=0.17.0          # 取消注释以启用 W&B 日志
+tensorboard>=2.14.0
+
+# ── 代码质量（可选） ──────────────────────────────────────────────────────
+# black>=24.0.0
+# isort>=5.13.0
+
+# =============================================================================
+# 注意事项
+# =============================================================================
+# 1. CANN / torch / torch_npu 版本对应关系（必须严格一致）：
+#      CANN 8.0.x  →  torch==2.1.0  + torch_npu==2.1.0.postX
+#      CANN 8.1.x  →  torch==2.3.1  + torch_npu==2.3.1
+#      CANN 8.2.RC1→  torch==2.4.0  + torch_npu==2.4.0      ← 本机适用
+#      CANN 8.3.x  →  torch==2.5.1  + torch_npu==2.5.1
+#
+# 2. Python 版本：torch_npu 2.4.0 支持 Python 3.8~3.11，不支持 3.13。
+#    服务器 base 环境为 3.13，务必在新建的 tfgrpo (python=3.10) 中运行。
+#
+# 3. numpy 版本：保持 <2.0.0，torch_npu 2.4.0 与 numpy 2.x 存在兼容风险。
+#
+# 4. sentence-transformers 的 Encoder 在 NPU 上运行时，
+#    SentenceTransformer(..., device="npu:0") 需要 torch_npu 已正确加载。
+#
+# 5. 若 Qwen2.5-Math-7B-Instruct 权重未下载：
+#    HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen2.5-Math-7B-Instruct
+#
+# 6. 多卡训练（hccl 后端）：
+#    torchrun --nproc_per_node=<NPU数量> train.py --device npu:0
+# =============================================================================

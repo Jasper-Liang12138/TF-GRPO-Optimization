@@ -6,7 +6,7 @@
 # ── 构建经验库（使用 parquet 文件）──────────────────────────────────────────
 python build_experience.py \
     --model Qwen/Qwen2.5-Math-7B-Instruct \
-    --data_path /path/to/dapo-math-17k.parquet \
+    --data_path /data/jbliang/dapo-math-17k.parquet \
     --sample_size 100 \
     --group_size 4 \
     --epochs 3 \

@@ -1,0 +1,77 @@
+# =============================================================================
+# TF-GRPO-Opt-Baseline — Conda 虚拟环境依赖
+# 运行环境与 TF-GRPO-Opt 完全相同，共用同一个 conda 虚拟环境（tfgrpo）即可。
+# 适用于：华为昇腾 NPU + CANN 8.2.RC1 + aarch64 架构
+#
+# !! 服务器 base 环境为 Python 3.13，torch_npu 不支持 3.13，
+# !! 必须新建 Python 3.10 的 conda 虚拟环境。
+#
+# 安装步骤（与 TF-GRPO-Opt 完全一致）：
+#
+#   # 1. 新建虚拟环境（Python 3.10）
+#   conda create -n tfgrpo python=3.10 -y
+#   conda activate tfgrpo
+#
+#   # 2. CANN 8.2.RC1 已在服务器上安装，跳过。
+#   #    若环境变量未加载，手动 source：
+#   #    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#
+#   # 3. 安装 torch 2.4.0 CPU 版（aarch64）
+#   #    方式一：conda-forge（推荐）
+#   conda install pytorch==2.4.0 cpuonly -c conda-forge -y
+#   #    方式二：pip
+#   #    pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu
+#
+#   # 4. 安装 torch_npu 2.4.0（CANN 8.2.RC1 对应版本）
+#   #    从 https://gitee.com/ascend/pytorch/releases/tag/v2.4.0 下载 aarch64 whl
+#   #    文件名示例：torch_npu-2.4.0-cp310-cp310-linux_aarch64.whl
+#   pip install torch_npu-2.4.0-cp310-cp310-linux_aarch64.whl
+#
+#   # 5. 安装本文件依赖
+#   pip install -r requirements.txt
+# =============================================================================
+
+# ── HuggingFace 生态 ──────────────────────────────────────────────────────
+transformers>=4.45.0,<5.0.0
+tokenizers>=0.20.0
+accelerate>=0.34.0
+datasets>=2.20.0
+huggingface_hub>=0.24.0
+
+# ── Sentence Transformers（TF-GRPO-Opt 需要，Baseline 不使用但保持环境一致） ──
+sentence-transformers>=2.7.0
+
+# ── 数据处理 ──────────────────────────────────────────────────────────────
+pandas>=2.0.0          # 用于读取 parquet 数据
+pyarrow>=14.0.0        # pandas parquet 后端
+
+# ── 数学答案评测 ──────────────────────────────────────────────────────────
+sympy>=1.12
+
+# ── 科学计算 ──────────────────────────────────────────────────────────────
+numpy>=1.24.0,<2.0.0
+
+# ── 训练工具 ──────────────────────────────────────────────────────────────
+tqdm>=4.66.0
+einops>=0.7.0
+
+# ── 日志与可视化（可选） ──────────────────────────────────────────────────
+tensorboard>=2.14.0
+# wandb>=0.17.0
+
+# =============================================================================
+# 注意事项（与 TF-GRPO-Opt 相同）：
+#
+# 1. CANN / torch / torch_npu 版本对应（必须严格一致）：
+#      CANN 8.2.RC1 → torch==2.4.0 + torch_npu==2.4.0  ← 本机适用
+#
+# 2. Python 版本：torch_npu 2.4.0 支持 Python 3.8~3.11，不支持 3.13。
+#    务必在 python=3.10 的新建环境中运行。
+#
+# 3. numpy 版本：保持 <2.0.0。
+#
+# 4. Qwen2.5-Math-7B-Instruct 权重预下载：
+#    HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen2.5-Math-7B-Instruct
+#
+# 5. 本 Baseline 与 TF-GRPO-Opt 共用同一个 conda 环境（tfgrpo）即可。
+# =============================================================================
