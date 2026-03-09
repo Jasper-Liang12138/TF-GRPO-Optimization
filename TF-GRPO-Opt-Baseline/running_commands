@@ -5,18 +5,27 @@
 
 # ── 构建经验库（使用 parquet 文件）──────────────────────────────────────────
 python build_experience.py \
-    --model Qwen/Qwen2.5-Math-7B-Instruct \
-    --data_path /path/to/dapo-math-17k.parquet \
+    --model /mnt/nvme0/models/Qwen2.5-Math-7B-Instruct \
+    --data_path /data/jbliang/dapo-math-17k.parquet \
     --sample_size 100 \
-    --group_size 4 \
+    --group_size 5 \
     --epochs 3 \
     --max_new_tokens 2048 \
     --device npu:0 \
     --output_dir ./output_logs
 
+python build_experience.py \
+      --model /mnt/nvme0/models/Qwen2.5-Math-7B-Instruct \
+      --data_path /data/jbliang/dapo-math-17k.parquet \
+      --sample_size 2 \
+      --group_size 2 \
+      --epochs 1 \
+      --device npu:0 \
+      --output_dir ./output_logs 2>&1 | grep -E "\[DEBUG\]|Epoch|problem|score|Exp"
+
 # ── 构建经验库（自动加载 HuggingFace GSM8K）────────────────────────────────
 python build_experience.py \
-    --model Qwen/Qwen2.5-Math-7B-Instruct \
+    --model /mnt/nvme0/models/Qwen2.5-Math-7B-Instruct \
     --sample_size 100 \
     --group_size 4 \
     --epochs 3 \
