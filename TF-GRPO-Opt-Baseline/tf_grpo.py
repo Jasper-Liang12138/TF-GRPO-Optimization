@@ -44,11 +44,9 @@ except ImportError:
 
 def _extract_json(text: str) -> Optional[dict]:
     """
-    尝试从模型输出中提取 JSON，兼容常见格式：
-      1. ```json ... ``` 代码块
-      2. 直接 json.loads
-      3. 提取首个 {...} 块
-    每次解析前先清洗尾逗号（Qwen 常见输出问题）。
+    尝试从模型输出中提取 JSON：
+      1. 直接 json.loads
+      2. 提取首个 {...} 块
     失败返回 None。
     """
     text = text.strip()
@@ -86,10 +84,10 @@ def _extract_json(text: str) -> Optional[dict]:
             brace_depth -= 1
             if brace_depth == 0 and start != -1:
                 candidate = text[start: i + 1]
-                result = _try_parse(candidate)
-                if result is not None:
-                    return result
-                start = -1  # 重置，继续找
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    start = -1  # 重置，继续找
     return None
 
 
@@ -230,10 +228,13 @@ class TF_GRPO:
             messages = list(messages)  # 浅拷贝，不改原列表
             last = messages[-1].copy()
             last["content"] = last["content"] + (
-                "\n\nIMPORTANT: Your response MUST be valid JSON only. "
-                "Do not include any explanation outside the JSON object."
+                "\n\nIMPORTANT: Output valid JSON ONLY. "
+                "No explanation, no markdown code block, no extra text. "
+                "Start your response directly with { and end with }."
             )
             messages[-1] = last
+            # JSON 调用用低温，减少随机性
+            temperature = min(temperature, 0.2)
 
         # 应用 chat template
         prompt_text = self.tokenizer.apply_chat_template(
@@ -367,11 +368,6 @@ class TF_GRPO:
             {"role": "user", "content": user_prompt},
         ]
         res = self.call_llm(messages, temperature=0.7, json_mode=True)
-        data = _extract_json(res)
-        if data is None:
-            # 首次失败，重试一次
-            res = self.call_llm(messages, temperature=0.7, json_mode=True)
-            data = _extract_json(res)
 
         try:
             if data is None:
@@ -410,11 +406,9 @@ class TF_GRPO:
 
         except Exception as e:
             print(f"[Exp Controller Error] {e}")
-            if len(old_exps) == target_count:
-                return old_exps
-            if len(old_exps) > target_count:
-                return old_exps[:target_count]
-            return old_exps + [default_item] * (target_count - len(old_exps))
+            # 规则兜底：直接把 advantage>0 的 observation summary 存为经验，
+            # 比全部 fallback 成默认值更有实际意义
+            return self._rule_based_experiences(observations, old_exps, target_count, default_item)
 
     # ===================== 4. 主训练循环 =====================
 
@@ -460,16 +454,25 @@ class TF_GRPO:
             print(f"\n{'='*20} Epoch {ep+1}/{epochs} {'='*20}")
 
             for idx, item in enumerate(tqdm(self.dataset)):
-                # 兼容两种数据格式
-                if "prompt" in item and isinstance(item.get("prompt"), list):
-                    q = item["prompt"][0]["content"]
-                    gold = item["reward_model"]["ground_truth"]
+                # 兼容两种数据格式（与原版逻辑一致）
+                # pandas 读 parquet 后 prompt 列为 numpy.ndarray，直接索引即可
+                if "reward_model" in item:
+                    # DAPO-Math 格式
+                    q = str(item["prompt"][0]["content"])
+                    gold = str(item["reward_model"]["ground_truth"])
                 else:
+                    # GSM8K 格式
                     q = item.get("question", item.get("problem", ""))
                     gold = self._extract_gsm8k_gold(item.get("answer", ""))
 
-                # 1. 提取当前经验 → 构造 system prompt（与原版一致）
+                # 首题打印题目前 120 字，确认读取正确
+                if idx == 0 and ep == 0:
+                    print(f"[DEBUG] q[:120] = {q[:120]!r}")
+                    print(f"[DEBUG] gold = {gold!r}")
+
+                # 1. 提取当前经验 → 构造 messages（始终重新构造，与原版一致）
                 current_exps = self.experience_bank.get(idx, [])
+
                 if current_exps:
                     exp_lines = []
                     for i, e in enumerate(current_exps):
@@ -479,8 +482,7 @@ class TF_GRPO:
                     exp_str = "\n".join(exp_lines)
                     system_content = (
                         "You are a math problem solver. "
-                        "Please refer to the following historical experiences (with confidence scores) "
-                        "to solve this problem:\n"
+                        "Please refer to the following historical experiences (with confidence scores) to solve this problem:\n"
                         f"{exp_str}\n\n"
                         "Think step by step."
                     )
@@ -509,6 +511,13 @@ class TF_GRPO:
                 if len(indiv_sums) < self.group_size:
                     indiv_sums.extend([""] * (self.group_size - len(indiv_sums)))
 
+                # batch_summarize 失败时用 rollout 原文（截断）替代，
+                # 保证 observations 始终有实质内容传入 exp_controller
+                FAILED = {"", "Summary failed"}
+                for i in range(self.group_size):
+                    if indiv_sums[i].strip() in FAILED:
+                        indiv_sums[i] = outputs[i][:300] if outputs[i] else ""
+
                 observations: List[Dict] = []
                 for i in range(self.group_size):
                     observations.append({"summary": indiv_sums[i], "advantage": advantages[i]})
@@ -532,8 +541,8 @@ class TF_GRPO:
             for idx, exps in self.experience_bank.items():
                 if idx < len(self.dataset):
                     item = self.dataset[idx]
-                    if "prompt" in item and isinstance(item.get("prompt"), list):
-                        prob_text = item["prompt"][0]["content"]
+                    if "reward_model" in item:
+                        prob_text = str(item["prompt"][0]["content"])
                     else:
                         prob_text = item.get("question", item.get("problem", "Unknown"))
                 else:
@@ -555,6 +564,37 @@ class TF_GRPO:
             print(f"[TF-GRPO] 经验库已保存 → {save_path}")
 
     # ── 工具 ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _rule_based_experiences(
+        observations: List[Dict],
+        old_exps: List[Dict],
+        target_count: int,
+        default_item: Dict,
+    ) -> List[Dict]:
+        """
+        LLM JSON 生成失败时的规则兜底：
+        按 advantage 降序取 summary，不论正负（全为 0 时也照常存入），
+        只跳过空文本和明确失败标记。
+        """
+        INVALID = {"", "Summary failed", "[Global] Summary failed"}
+        sorted_obs = sorted(observations, key=lambda x: x["advantage"], reverse=True)
+        result: List[Dict] = []
+        for obs in sorted_obs:
+            text = obs["summary"].strip()
+            if text not in INVALID:
+                result.append({"text": text[:300], "score": round(obs["advantage"], 4)})
+            if len(result) >= target_count:
+                break
+        # 用旧经验补齐
+        for exp in old_exps:
+            if len(result) >= target_count:
+                break
+            result.append(exp)
+        # 最后用默认值补足
+        while len(result) < target_count:
+            result.append(default_item.copy())
+        return result[:target_count]
 
     @staticmethod
     def _extract_gsm8k_gold(answer_text: str) -> str:
