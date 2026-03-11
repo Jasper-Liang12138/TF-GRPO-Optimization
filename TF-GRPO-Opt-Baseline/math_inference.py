@@ -245,8 +245,8 @@ def main() -> None:
 
     print(f"[Step 3] 开始推理（共 {len(dataset)} 条）...")
     for idx, data in enumerate(tqdm(dataset)):
-        question = data.get("instruction", "") or data.get("question", "")
-        gold_answer = data.get("answer", "")
+        question = data.get("instruction", "") or data.get("question", "") or data.get("sQuestion", "")
+        gold_answer = data.get("answer", data.get("lSolutions", ""))
 
         if args.dataset == "AQuA":
             messages = build_aqua_prompt(question, global_experiences_text)
@@ -255,7 +255,7 @@ def main() -> None:
 
         # 保存第一条 prompt 用于调试（与原版一致）
         if idx == 0:
-            debug_file = "debug_prompt_problem_1.json"
+            debug_file = os.path.join(save_dir or ".", "debug_prompt_problem_1.json")
             with open(debug_file, "w", encoding="utf-8") as f:
                 json.dump(messages, f, indent=4, ensure_ascii=False)
             print(f"\n[DEBUG] 第 1 题完整 prompt 已保存至: {debug_file}\n")

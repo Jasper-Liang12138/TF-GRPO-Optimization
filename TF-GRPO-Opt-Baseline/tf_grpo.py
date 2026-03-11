@@ -252,15 +252,17 @@ class TF_GRPO:
         max_tok = 2048 if json_mode else self.max_new_tokens
 
         with torch.no_grad():
-            output_ids = self.model.generate(
+            gen_kwargs = dict(
                 **inputs,
                 max_new_tokens=max_tok,
                 do_sample=(temperature > 0),
-                temperature=temperature if temperature > 0 else 1.0,
-                top_p=0.9,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
+            if temperature > 0:
+                gen_kwargs["temperature"] = temperature
+                gen_kwargs["top_p"] = 0.9
+            output_ids = self.model.generate(**gen_kwargs)
 
         # 只取新生成的 token
         new_ids = output_ids[0][inputs.input_ids.shape[1]:]
@@ -367,7 +369,8 @@ class TF_GRPO:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        res = self.call_llm(messages, temperature=0.7, json_mode=True)
+        res = self.call_llm(messages, temperature=0.2, json_mode=True)
+        data = _extract_json(res)
 
         try:
             if data is None:
@@ -462,8 +465,8 @@ class TF_GRPO:
                     gold = str(item["reward_model"]["ground_truth"])
                 else:
                     # GSM8K 格式
-                    q = item.get("question", item.get("problem", ""))
-                    gold = self._extract_gsm8k_gold(item.get("answer", ""))
+                    q = self._extract_question_text(item)
+                    gold = self._extract_gold_answer(item)
 
                 # 首题打印题目前 120 字，确认读取正确
                 if idx == 0 and ep == 0:
@@ -544,7 +547,7 @@ class TF_GRPO:
                     if "reward_model" in item:
                         prob_text = str(item["prompt"][0]["content"])
                     else:
-                        prob_text = item.get("question", item.get("problem", "Unknown"))
+                        prob_text = self._extract_question_text(item) or "Unknown"
                 else:
                     prob_text = "Unknown Problem"
 
@@ -577,24 +580,126 @@ class TF_GRPO:
         按 advantage 降序取 summary，不论正负（全为 0 时也照常存入），
         只跳过空文本和明确失败标记。
         """
-        INVALID = {"", "Summary failed", "[Global] Summary failed"}
+        INVALID = {
+            "",
+            "Summary failed",
+            "Summary failed.",
+            "[Global] Summary failed",
+            "[Global] Summary failed.",
+        }
         sorted_obs = sorted(observations, key=lambda x: x["advantage"], reverse=True)
         result: List[Dict] = []
+        seen: set[str] = set()
         for obs in sorted_obs:
-            text = obs["summary"].strip()
+            text = TF_GRPO._compact_experience_text(obs["summary"])
             if text not in INVALID:
-                result.append({"text": text[:300], "score": round(obs["advantage"], 4)})
+                normalized = re.sub(r"\s+", " ", text.lower()).strip()
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                result.append({"text": text[:220], "score": round(obs["advantage"], 4)})
             if len(result) >= target_count:
                 break
         # 用旧经验补齐
         for exp in old_exps:
             if len(result) >= target_count:
                 break
-            result.append(exp)
+            text = TF_GRPO._compact_experience_text(str(exp.get("text", "")))
+            normalized = re.sub(r"\s+", " ", text.lower()).strip()
+            if not text or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append({"text": text[:220], "score": exp.get("score", 0.0)})
         # 最后用默认值补足
         while len(result) < target_count:
             result.append(default_item.copy())
         return result[:target_count]
+
+    @staticmethod
+    def _compact_experience_text(text: str) -> str:
+        """
+        将 rollout/summary 压缩成更短、更像经验的句子，避免把整段解题过程
+        原样塞进经验库。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return ""
+
+        text = text.replace("[Global]", " ")
+        text = text.replace("**", " ")
+        text = re.sub(r"```[\s\S]*?```", " ", text)
+        text = re.sub(r"\$\$[\s\S]*?\$\$", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        text = text[:800]
+        text = re.sub(
+            r"^to determine .*?,\s*we need to\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"^according to the problem,\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"^first,?\s*let'?s\s*(find|calculate)\s*(out)?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        preferred = []
+        sentences = re.split(r"(?<=[\.\!\?])\s+", text)
+        keywords = (
+            "first", "then", "therefore", "since", "because", "total", "sum",
+            "difference", "remaining", "each", "per", "rate", "fraction",
+            "percent", "multiply", "divide", "subtract", "add", "equation"
+        )
+        for sentence in sentences:
+            clean = sentence.strip(" -:;,.")
+            if len(clean) < 20:
+                continue
+            if any(word in clean.lower() for word in keywords):
+                preferred.append(clean)
+
+        if preferred:
+            text = " ".join(preferred[:2])
+        elif sentences:
+            text = sentences[0].strip(" -:;,.")
+
+        text = re.sub(r"\\\[[\s\S]*?\\\]", " ", text)
+        text = re.sub(r"\\\([\s\S]*?\\\)", " ", text)
+        text = re.sub(r"\s*:\s*", ": ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if text and not text.endswith((".", "!", "?")):
+            text += "."
+
+        if len(text) > 220:
+            text = text[:217].rsplit(" ", 1)[0] + "..."
+        return text
+
+    @staticmethod
+    def _extract_question_text(item: Dict[str, Any]) -> str:
+        return str(
+            item.get("question")
+            or item.get("problem")
+            or item.get("instruction")
+            or item.get("sQuestion")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _extract_gold_answer(item: Dict[str, Any]) -> str:
+        if "lSolutions" in item:
+            return str(item.get("lSolutions", "")).strip()
+        if "answer" in item:
+            return TF_GRPO._extract_gsm8k_gold(str(item.get("answer", "")))
+        if "output" in item:
+            return TF_GRPO._extract_gsm8k_gold(str(item.get("output", "")))
+        return ""
 
     @staticmethod
     def _extract_gsm8k_gold(answer_text: str) -> str:

@@ -22,6 +22,7 @@ build_experience.py — 构建经验库入口
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 
@@ -133,6 +134,14 @@ def main() -> None:
         device=args.device,
         torch_dtype=args.torch_dtype,
     )
+
+    if args.data_path and args.data_path.lower().endswith(".json") and os.path.exists(args.data_path):
+        print(f"[Data] ????? JSON: {args.data_path}")
+        with open(args.data_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        actual_size = min(args.sample_size, len(records))
+        agent.dataset = random.sample(records, actual_size)
+        print(f"[Data] ?? JSON ???? {actual_size} ??")
 
     print(">>> Starting TF-GRPO <<<")
     agent.train_loop(
